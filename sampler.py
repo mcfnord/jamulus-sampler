@@ -514,6 +514,8 @@ def _do_srv_task(srv_key: str):
         state['_min_probe'] = time.time() + 1.0  # prevent re-entry within 1s
         prev_probe_time = state['_last_probe_start']
 
+    global _probes_total
+    _probes_total += 1
     probe_start = time.time()
     try:
         result = probe_server(ip, port)
@@ -525,9 +527,6 @@ def _do_srv_task(srv_key: str):
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
         return
     now = time.time()
-
-    global _probes_total
-    _probes_total += 1
 
     with _STATE_LOCK:
         if ip_port not in SERVER_STATE:
