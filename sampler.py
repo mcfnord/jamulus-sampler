@@ -36,7 +36,8 @@ CLM_REQ_CONN_CLIENTS_LIST   = 1014
 
 PROBE_ACTIVE    =   3.0   # s — after client-set change
 PROBE_STABLE    =  15.0   # s — clients present, stable
-PROBE_IDLE      =  60.0   # s — no clients
+PROBE_IDLE      =  60.0   # s — no clients (recently emptied or recently requested)
+PROBE_DORMANT   = 600.0   # s — no clients, directory not recently requested
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -452,6 +453,7 @@ def _do_dir_task(dir_key: str):
             'servers': [f"{s['ip']}:{s['port']}" for s in servers],
             'last_sweep': now,
             'sweep_count': prev_sweep_count + 1,
+            'last_request_time': DIRECTORY_STATE.get(host_port, {}).get('last_request_time', 0.0),
         }
         for s in servers:
             key = f"{s['ip']}:{s['port']}"
@@ -540,7 +542,7 @@ def _do_srv_task(srv_key: str):
         if result is None:
             state['ping'] = -1
             # Empty server with flaky 1002: retry at PROBE_STABLE to catch new clients faster
-            interval = PROBE_STABLE if state['nclients'] == 0 else PROBE_IDLE
+            interval = PROBE_STABLE if state['nclients'] > 0 else PROBE_DORMANT
         else:
             state['ping']        = result['ping']
             state['nclients']    = result['nclients']
@@ -564,7 +566,7 @@ def _do_srv_task(srv_key: str):
             elif result['nclients'] > 0:
                 interval = PROBE_STABLE
             else:
-                interval = PROBE_IDLE
+                interval = PROBE_DORMANT
 
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
@@ -724,13 +726,27 @@ class Handler(BaseHTTPRequestHandler):
         host_port = f"{host}:{port}"
         dir_key   = f"dir:{host_port}"
 
+        now_req = time.time()
         with _STATE_LOCK:
             ds = DIRECTORY_STATE.get(host_port)
             if ds is None:
-                _schedule(time.time(), dir_key)
+                _schedule(now_req, dir_key)
                 self._send(200, [])
                 return
+            ds['last_request_time'] = now_req
             result = _build_dir_rows(host_port, ds)
+            servers_to_poke = [
+                ip_port for ip_port in ds.get('servers', [])
+                if ip_port in SERVER_STATE
+                and SERVER_STATE[ip_port]['nclients'] == 0
+                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > PROBE_IDLE
+            ]
+
+        for ip_port in servers_to_poke:
+            with _STATE_LOCK:
+                if ip_port in SERVER_STATE:
+                    SERVER_STATE[ip_port]['_min_probe'] = 0.0
+            _schedule(now_req, f'srv:{ip_port}')
 
         self._send(200, result)
 
