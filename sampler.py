@@ -487,8 +487,9 @@ def _do_dir_task(dir_key: str):
             key = f"{s['ip']}:{s['port']}"
             if key not in new_keys and key in SERVER_STATE:
                 if SERVER_STATE[key]['ping'] < 0:
-                    SERVER_STATE[key]['_min_probe'] = 0.0
-                    _schedule(now, f"srv:{key}")
+                    if now - SERVER_STATE[key]['_last_probe_start'] > DIRECTORY_SWEEP:
+                        SERVER_STATE[key]['_min_probe'] = 0.0
+                        _schedule(now, f"srv:{key}")
 
     _schedule(now + DIRECTORY_SWEEP, dir_key)
     print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new",
