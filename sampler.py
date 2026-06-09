@@ -383,6 +383,8 @@ def probe_server(ip: str, port: int):
                     break
                 if ping_pass == 0:
                     send_ping()
+                elif ping_pass == 2 and want_clients and not got_clients:
+                    sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (ip, port))
 
         return result  # ping=-1 if unreachable; caller handles
     finally:
