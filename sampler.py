@@ -446,10 +446,12 @@ def _do_dir_task(dir_key: str):
     now = time.time()
     new_keys = []
     with _STATE_LOCK:
+        prev_sweep_count = DIRECTORY_STATE.get(host_port, {}).get('sweep_count', 0)
         DIRECTORY_STATE[host_port] = {
             'host': host, 'port': port,
             'servers': [f"{s['ip']}:{s['port']}" for s in servers],
             'last_sweep': now,
+            'sweep_count': prev_sweep_count + 1,
         }
         for s in servers:
             key = f"{s['ip']}:{s['port']}"
@@ -464,6 +466,7 @@ def _do_dir_task(dir_key: str):
                     'first_seen': {}, 'last_absent': {}, 'last_changed': 0.0,
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
+                    '_probe_attempts': 0, '_probe_successes': 0,
                 }
                 new_keys.append(key)
             else:
@@ -529,6 +532,9 @@ def _do_srv_task(srv_key: str):
         state = SERVER_STATE[ip_port]
         state['_min_probe'] = 0.0
         state['_last_probe_start'] = probe_start
+        state['_probe_attempts'] += 1
+        if result is not None and result.get('ping', -1) >= 0:
+            state['_probe_successes'] += 1
 
         if result is None:
             state['ping'] = -1
@@ -642,7 +648,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if p.path == '/stats':
-            elapsed = time.time() - _probes_t0
+            now_s   = time.time()
+            elapsed = now_s - _probes_t0
             with _heap_lock:
                 heap_depth = len(_heap)
             with _STATE_LOCK:
@@ -650,7 +657,29 @@ class Handler(BaseHTTPRequestHandler):
                 n_reachable = sum(1 for s in SERVER_STATE.values() if s['ping'] >= 0)
                 n_clients   = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
                 n_active    = sum(1 for s in SERVER_STATE.values()
-                                  if s['ping'] >= 0 and s['last_changed'] > time.time() - PROBE_ACTIVE * 2)
+                                  if s['ping'] >= 0 and s['last_changed'] > now_s - PROBE_ACTIVE * 2)
+                dirs_info = [
+                    {
+                        'host_port':        hp,
+                        'last_sweep_ago_s': round(now_s - ds['last_sweep'], 1),
+                        'server_count':     len(ds['servers']),
+                        'sweep_count':      ds.get('sweep_count', 0),
+                    }
+                    for hp, ds in DIRECTORY_STATE.items()
+                ]
+                unreachable_servers = [
+                    {
+                        'ip_port':         ip_port,
+                        'name':            s['name'],
+                        'probe_attempts':  s['_probe_attempts'],
+                        'probe_successes': s['_probe_successes'],
+                        'last_probe_ago_s': (
+                            round(now_s - s['_last_probe_start'], 1)
+                            if s['_last_probe_start'] else None
+                        ),
+                    }
+                    for ip_port, s in SERVER_STATE.items() if s['ping'] < 0
+                ]
             self._send(200, {
                 'uptime_s':   round(elapsed, 1),
                 'port_pool': {
@@ -661,9 +690,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
                 'heap_depth': heap_depth,
                 'servers': {
-                    'total':      n_total,
-                    'reachable':  n_reachable,
-                    'unreachable': n_total - n_reachable,
+                    'total':        n_total,
+                    'reachable':    n_reachable,
+                    'unreachable':  n_total - n_reachable,
                     'with_clients': n_clients,
                     'active_tier':  n_active,
                 },
@@ -671,8 +700,11 @@ class Handler(BaseHTTPRequestHandler):
                     'submitted':  _tasks_submitted,
                     'completed':  _probes_total,
                     'queued':     _tasks_submitted - _probes_total,
+                    'per_second': round(_probes_total / elapsed, 3) if elapsed > 0 else 0,
                     'per_minute': round(_probes_total / elapsed * 60, 1) if elapsed > 0 else 0,
                 },
+                'directories':          dirs_info,
+                'unreachable_servers':  unreachable_servers,
             })
             return
 
