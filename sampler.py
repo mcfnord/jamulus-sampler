@@ -277,18 +277,25 @@ def _parse_client_list(payload: bytes) -> list:
 # ── UDP operations ────────────────────────────────────────────────────────────
 
 def sweep_directory(host: str, port: int):
-    """Query directory for its server list only (no per-server pinging).
-    Returns (list_of_server_dicts, None) or (None, error_str)."""
+    """Query directory for server list, then collect server-initiated pings on the same socket.
+    When the directory receives CLM_REQ_SERVER_LIST it tells each registered server to ping
+    back to our source port — this is the NAT hole-punch that makes servers reachable.
+    Returns (server_list, probe_results, None) or (None, None, error_str).
+    probe_results: dict of 'ip:port' → {'ping': ms, 'nclients': n, 'clients': [...]}
+    """
     try:
         ip = socket.gethostbyname(host)
     except socket.gaierror as e:
-        return None, str(e)
+        return None, None, str(e)
 
     lport = _acquire_port()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(TIMEOUT_SEC)
     try:
         sock.bind(('0.0.0.0', lport))
+
+        # Phase 1: get server list from directory
+        server_list = None
         for _ in range(MAX_ATTEMPTS):
             sock.sendto(build_packet(CLM_REQ_SERVER_LIST), (ip, port))
             try:
@@ -296,10 +303,56 @@ def sweep_directory(host: str, port: int):
                     data, _ = sock.recvfrom(32767)
                     parsed = parse_header(data)
                     if parsed and parsed[0] == CLM_SERVER_LIST:
-                        return _parse_server_list(parsed[2], ip, port), None
+                        server_list = _parse_server_list(parsed[2], ip, port)
+                        break
             except socket.timeout:
                 pass
-        return None, f"no response from {host}:{port} after {MAX_ATTEMPTS} attempts"
+            if server_list is not None:
+                break
+
+        if server_list is None:
+            return None, None, f"no response from {host}:{port} after {MAX_ATTEMPTS} attempts"
+
+        # Phase 2: collect server-initiated pings. The directory has now notified each
+        # registered server to send CLM_PING_MS_WITHNUMCLIENTS to our lport — that exchange
+        # opens the firewall path. Receive those pings and request client lists on the same socket.
+        server_keys = {f"{s['ip']}:{s['port']}" for s in server_list}
+        probe_results = {}   # ip:port → {ping, nclients, clients}
+        clients_requested = set()
+
+        deadline = time.time() + TIMEOUT_SEC
+        while time.time() < deadline:
+            try:
+                data, (fip, fport) = sock.recvfrom(32767)
+                parsed = parse_header(data)
+                if not parsed:
+                    continue
+                mid, _, payload = parsed
+                key = f"{fip}:{fport}"
+                if key not in server_keys:
+                    continue
+
+                if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
+                    timems_r, nclients = struct.unpack_from('<IB', payload)
+                    now_ms = int(time.time() * 1000) % 86400000
+                    rtt = now_ms - timems_r
+                    if key not in probe_results:
+                        probe_results[key] = {'ping': rtt if 0 <= rtt < 30000 else 0,
+                                              'nclients': nclients, 'clients': []}
+                    else:
+                        probe_results[key]['nclients'] = nclients
+                    if nclients > 0 and key not in clients_requested:
+                        sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
+                        clients_requested.add(key)
+
+                elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
+                    probe_results[key]['clients'] = _parse_client_list(payload)
+
+            except socket.timeout:
+                if len(probe_results) >= len(server_list):
+                    break  # heard from all servers, done early
+
+        return server_list, probe_results, None
     finally:
         sock.close()
         _release_port(lport)
@@ -440,7 +493,7 @@ def _do_dir_task(dir_key: str):
     host, _, port_str = host_port.rpartition(':')
     port = int(port_str)
 
-    servers, err = sweep_directory(host, port)
+    servers, probe_results, err = sweep_directory(host, port)
     if err:
         print(f"[dir] sweep failed {host}:{port}: {err}", file=sys.stderr, flush=True)
         _schedule(time.time() + DIRECTORY_SWEEP, dir_key)
@@ -471,6 +524,7 @@ def _do_dir_task(dir_key: str):
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
                     '_probe_attempts': 0, '_probe_successes': 0,
+                    '_probe_inflight': False,
                 }
                 new_keys.append(key)
             else:
@@ -482,22 +536,52 @@ def _do_dir_task(dir_key: str):
                 ss['maxclients'] = s['maxclients']
                 ss['perm']       = s['perm']
 
+        # Apply probe_results collected on the directory socket (hole-punch pings).
+        # Servers that responded get their ping/nclients/clients updated directly here;
+        # their scheduled probe tasks will handle ongoing refreshes at adaptive rates.
+        for key, pr in probe_results.items():
+            if key not in SERVER_STATE:
+                continue
+            ss = SERVER_STATE[key]
+            ss['ping']     = pr['ping']
+            ss['nclients'] = pr['nclients']
+            ss['_probe_attempts']  += 1
+            ss['_probe_successes'] += 1
+            ss['_last_probe_start'] = now
+            new_clients = pr['clients']
+            old_set = frozenset(
+                (c['name'], c['countryid'], c['instrumentid'], c['city'])
+                for c in ss['clients']
+            )
+            new_set = frozenset(
+                (c['name'], c['countryid'], c['instrumentid'], c['city'])
+                for c in new_clients
+            )
+            if new_set != old_set:
+                ss['last_changed'] = now
+            for c in new_clients:
+                fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
+                if fkey not in ss['first_seen']:
+                    ss['first_seen'][fkey] = now
+                    ss['last_absent'][fkey] = ss['_last_probe_start']
+            ss['clients'] = new_clients
+
     for key in new_keys:
         _schedule(now, f"srv:{key}")
 
-    # After each sweep the NAT hole is open — immediately reprobe any ping=-1 servers
+    # Schedule immediate probes for servers that did NOT respond to the directory introduction
+    # (they may require a direct probe, or may be genuinely unreachable)
     with _STATE_LOCK:
         for s in servers:
             key = f"{s['ip']}:{s['port']}"
-            if key not in new_keys and key in SERVER_STATE:
-                if SERVER_STATE[key]['ping'] < 0:
-                    if now - SERVER_STATE[key]['_last_probe_start'] > DIRECTORY_SWEEP:
-                        SERVER_STATE[key]['_min_probe'] = 0.0
-                        _schedule(now, f"srv:{key}")
+            if key not in probe_results and key in SERVER_STATE:
+                if now - SERVER_STATE[key]['_last_probe_start'] > DIRECTORY_SWEEP:
+                    SERVER_STATE[key]['_min_probe'] = 0.0
+                    _schedule(now, f"srv:{key}")
 
     _schedule(now + DIRECTORY_SWEEP, dir_key)
-    print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new",
-          file=sys.stderr, flush=True)
+    print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new, "
+          f"{len(probe_results)} pinged back", file=sys.stderr, flush=True)
 
 
 def _do_srv_task(srv_key: str):
@@ -512,6 +596,7 @@ def _do_srv_task(srv_key: str):
             return
         state = SERVER_STATE[ip_port]
         if time.time() < state['_min_probe']:
+            state['_probe_inflight'] = False
             return  # stale heap entry — a probe already ran recently
         state['_min_probe'] = time.time() + 1.0  # prevent re-entry within 1s
         prev_probe_time = state['_last_probe_start']
@@ -527,6 +612,7 @@ def _do_srv_task(srv_key: str):
         with _STATE_LOCK:
             if ip_port in SERVER_STATE:
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
+                SERVER_STATE[ip_port]['_probe_inflight'] = False
         return
     now = time.time()
 
@@ -578,6 +664,8 @@ def _do_srv_task(srv_key: str):
             state['clients']    = new_clients
             state['_min_probe'] = now + interval * 0.8
 
+        state['_probe_inflight'] = False
+
     _schedule(now + interval, srv_key)
 
 # ── Scheduler thread + executor ───────────────────────────────────────────────
@@ -591,6 +679,12 @@ def _scheduler_loop():
             if key.startswith('dir:'):
                 _executor.submit(_do_dir_task, key)
             else:
+                ip_port = key[4:]
+                with _STATE_LOCK:
+                    state = SERVER_STATE.get(ip_port)
+                    if state is None or state['_probe_inflight']:
+                        continue
+                    state['_probe_inflight'] = True
                 _tasks_submitted += 1
                 _executor.submit(_do_srv_task, key)
         sleep = max(0.05, min(_heap_next_time() - time.time(), 1.0))
@@ -662,6 +756,7 @@ class Handler(BaseHTTPRequestHandler):
                 n_clients   = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
                 n_active    = sum(1 for s in SERVER_STATE.values()
                                   if s['ping'] >= 0 and s['last_changed'] > now_s - PROBE_ACTIVE * 2)
+                n_inflight  = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
                 dirs_info = [
                     {
                         'host_port':        hp,
@@ -703,7 +798,7 @@ class Handler(BaseHTTPRequestHandler):
                 'probes': {
                     'submitted':  _tasks_submitted,
                     'completed':  _probes_total,
-                    'queued':     _tasks_submitted - _probes_total,
+                    'inflight':   n_inflight,
                     'per_second': round(_probes_total / elapsed, 3) if elapsed > 0 else 0,
                     'per_minute': round(_probes_total / elapsed * 60, 1) if elapsed > 0 else 0,
                 },
@@ -741,6 +836,7 @@ class Handler(BaseHTTPRequestHandler):
                 if ip_port in SERVER_STATE
                 and SERVER_STATE[ip_port]['nclients'] == 0
                 and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > PROBE_IDLE
+                and SERVER_STATE[ip_port]['_min_probe'] <= now_req
             ]
 
         for ip_port in servers_to_poke:
