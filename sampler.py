@@ -352,6 +352,46 @@ def sweep_directory(host: str, port: int):
                 if len(probe_results) >= len(server_list):
                     break  # heard from all servers, done early
 
+        # Phase 3: active probe for servers that didn't ping back during the passive window.
+        # Send CLM_PING from this same socket (same source port the directory advertised to
+        # each server) — the hole-punch path is already open, so strict-firewall servers
+        # like those behind certain NAT/firewall configs will respond here but not to
+        # probe_server (which uses a different pool port they've never seen).
+        missed = server_keys - set(probe_results.keys())
+        if missed:
+            ms = int(time.time() * 1000) % 86400000
+            ping_pkt = build_packet(CLM_PING_MS_WITHNUMCLIENTS, struct.pack('<IB', ms, 0))
+            for key in missed:
+                s_ip, s_port_str = key.rsplit(':', 1)
+                try:
+                    sock.sendto(ping_pkt, (s_ip, int(s_port_str)))
+                except OSError:
+                    pass
+            deadline = time.time() + TIMEOUT_SEC
+            while time.time() < deadline:
+                try:
+                    data, (fip, fport) = sock.recvfrom(32767)
+                    parsed = parse_header(data)
+                    if not parsed:
+                        continue
+                    mid, _, payload = parsed
+                    key = f"{fip}:{fport}"
+                    if key not in server_keys or key in probe_results:
+                        continue
+                    if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
+                        timems_r, nclients = struct.unpack_from('<IB', payload)
+                        now_ms = int(time.time() * 1000) % 86400000
+                        rtt = now_ms - timems_r
+                        probe_results[key] = {'ping': rtt if 0 <= rtt < 30000 else 0,
+                                              'nclients': nclients, 'clients': []}
+                        if nclients > 0 and key not in clients_requested:
+                            sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
+                            clients_requested.add(key)
+                    elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
+                        probe_results[key]['clients'] = _parse_client_list(payload)
+                except socket.timeout:
+                    break
+
         return server_list, probe_results, None
     finally:
         sock.close()
@@ -523,6 +563,7 @@ def _do_dir_task(dir_key: str):
                     'first_seen': {}, 'last_absent': {}, 'last_changed': 0.0,
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
+                    '_last_sweep_success': 0.0,
                     '_probe_attempts': 0, '_probe_successes': 0,
                     '_probe_inflight': False,
                 }
@@ -548,6 +589,7 @@ def _do_dir_task(dir_key: str):
             ss['_probe_attempts']  += 1
             ss['_probe_successes'] += 1
             ss['_last_probe_start'] = now
+            ss['_last_sweep_success'] = now
             new_clients = pr['clients']
             old_set = frozenset(
                 (c['name'], c['countryid'], c['instrumentid'], c['city'])
@@ -626,12 +668,18 @@ def _do_srv_task(srv_key: str):
         if result is not None and result.get('ping', -1) >= 0:
             state['_probe_successes'] += 1
 
+        sweep_age = now - state.get('_last_sweep_success', 0)
+        sweep_fresh = sweep_age < DIRECTORY_SWEEP * 2
+
         if result is None:
-            state['ping'] = -1
+            if not sweep_fresh:
+                state['ping'] = -1
             # Empty server with flaky 1002: retry at PROBE_STABLE to catch new clients faster
             interval = PROBE_STABLE if state['nclients'] > 0 else PROBE_DORMANT
         else:
-            state['ping']        = result['ping']
+            # Only overwrite a sweep-obtained ping with a failure if the sweep is stale
+            if result['ping'] >= 0 or not sweep_fresh:
+                state['ping'] = result['ping']
             state['nclients']    = result['nclients']
             state['os']          = result['os']
             state['version']     = result['version']
