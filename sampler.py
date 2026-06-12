@@ -37,8 +37,8 @@ CLM_REQ_CONN_CLIENTS_LIST   = 1014
 
 PROBE_ACTIVE    =   3.0   # s — after client-set change
 PROBE_STABLE    =  15.0   # s — clients present, stable
-PROBE_IDLE      =  30.0   # s — no clients
-PROBE_DORMANT   =  30.0   # s — no clients (was 600s, then 60s)
+PROBE_IDLE      =  20.0   # s — no clients
+PROBE_DORMANT   =  20.0   # s — no clients (was 600s, then 60s)
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
