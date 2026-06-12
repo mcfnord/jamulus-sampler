@@ -636,6 +636,7 @@ def _do_dir_task(dir_key: str):
             ss['nclients'] = pr['nclients']
             ss['_probe_attempts']  += 1
             ss['_probe_successes'] += 1
+            prev_sweep_time = ss['_last_probe_start']
             ss['_last_probe_start'] = now
             ss['_last_sweep_success'] = now
             new_clients = pr['clients']
@@ -656,7 +657,7 @@ def _do_dir_task(dir_key: str):
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
                 if fkey not in ss['first_seen']:
                     ss['first_seen'][fkey] = now
-                    ss['last_absent'][fkey] = ss['_last_probe_start']
+                    ss['last_absent'][fkey] = prev_sweep_time if prev_sweep_time > 0 else now
             ss['clients'] = new_clients
 
     for key in new_keys:
