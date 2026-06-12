@@ -14,7 +14,6 @@ import socket
 import struct
 import sys
 import threading
-from collections import deque
 import time
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -559,37 +558,27 @@ _probes_t0       = time.time()   # set at startup
 _tasks_submitted = 0   # total srv tasks dispatched to executor (including early-exit ones)
 
 # ── Activity tier (global probe-rate calibration) ─────────────────────────────────────
-_activity_history = deque(maxlen=40)   # total_clients sampled once per dir sweep
-_activity_tier    = "normal"
-_activity_p33     = 0
-_activity_p67     = 0
-_activity_lock    = threading.Lock()
 
-
-def _current_rates():
-    """Return (probe_active, probe_stable, probe_idle) for the current tier."""
-    with _activity_lock:
-        return _TIER_RATES[_activity_tier]
-
-
-def _update_activity_tier():
-    """Count total connected clients across all servers; recalibrate tier after 10 samples."""
-    with _STATE_LOCK:
-        total = sum(st["nclients"] for st in SERVER_STATE.values())
-    with _activity_lock:
-        global _activity_tier, _activity_p33, _activity_p67
-        _activity_history.append(total)
-        if len(_activity_history) < 10:
-            return
-        srt = sorted(_activity_history)
-        _activity_p33 = srt[len(srt) // 3]
-        _activity_p67 = srt[2 * len(srt) // 3]
-        if total < _activity_p33:
-            _activity_tier = "quiet"
-        elif total >= _activity_p67:
-            _activity_tier = "busy"
-        else:
-            _activity_tier = "normal"
+def _server_tier(ss):
+    """Return (probe_active, probe_stable, probe_idle) for one server.
+    Ranks the current hour against the server's own 24-int hourly event
+    history. Quiet hours get longer probe intervals; busy hours shorter.
+    Defaults to normal tier until the server has seen at least one event.
+    """
+    bins = ss['hourly_events']
+    if sum(bins) == 0:
+        return _TIER_RATES["normal"]
+    h = int(time.time()) % 86400 // 3600
+    current = bins[h]
+    srt = sorted(bins)
+    p33 = srt[8]    # 33rd percentile of 24 hourly values
+    p67 = srt[16]   # 67th percentile of 24 hourly values
+    if current <= p33:
+        return _TIER_RATES["quiet"]
+    elif current >= p67:
+        return _TIER_RATES["busy"]
+    else:
+        return _TIER_RATES["normal"]
 
 def _schedule(when: float, key: str):
     global _heap_cnt
@@ -645,6 +634,7 @@ def _do_dir_task(dir_key: str):
                     'ipaddrs': s['ipaddrs'],
                     'ping': -1, 'nclients': 0, 'clients': [],
                     'first_seen': {}, 'last_absent': {}, 'last_changed': 0.0,
+                    'hourly_events': [0] * 24,
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
                     '_last_sweep_success': 0.0,
@@ -686,6 +676,8 @@ def _do_dir_task(dir_key: str):
             )
             if new_set != old_set:
                 ss['last_changed'] = now
+                _h = int(now) % 86400 // 3600
+                ss['hourly_events'][_h] += len(old_set - new_set) + len(new_set - old_set)
                 for fkey in old_set - new_set:
                     ss['first_seen'].pop(fkey, None)
                     ss['last_absent'].pop(fkey, None)
@@ -709,7 +701,6 @@ def _do_dir_task(dir_key: str):
                     SERVER_STATE[key]['_min_probe'] = 0.0
                     _schedule(now, f"srv:{key}")
 
-    _update_activity_tier()
     _schedule(now + DIRECTORY_SWEEP, dir_key)
     print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new, "
           f"{len(probe_results)} pinged back", file=sys.stderr, flush=True)
@@ -739,11 +730,14 @@ def _do_srv_task(srv_key: str):
         result = probe_server(ip, port)
     except Exception as exc:
         print(f'[srv] {ip}:{port} probe exception: {exc}', file=sys.stderr, flush=True)
-        _schedule(time.time() + _current_rates()[2], srv_key)
         with _STATE_LOCK:
             if ip_port in SERVER_STATE:
+                _idle = _server_tier(SERVER_STATE[ip_port])[2]
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
                 SERVER_STATE[ip_port]['_probe_inflight'] = False
+            else:
+                _idle = _TIER_RATES['normal'][2]
+        _schedule(time.time() + _idle, srv_key)
         return
     now = time.time()
 
@@ -764,7 +758,8 @@ def _do_srv_task(srv_key: str):
             if not sweep_fresh:
                 state['ping'] = -1
             # Empty server with flaky 1002: retry at stable rate to catch new clients faster
-            interval = _current_rates()[1] if state['nclients'] > 0 else _current_rates()[2]
+            rates = _server_tier(state)
+            interval = rates[1] if state['nclients'] > 0 else rates[2]
         else:
             # Only overwrite sweep-obtained data when the probe actually got a response.
             # A failed probe (ping=-1) from pool ports cannot reach NAT-strict servers;
@@ -790,14 +785,16 @@ def _do_srv_task(srv_key: str):
 
             if new_set != old_set:
                 state['last_changed'] = now
-                interval = _current_rates()[0]
+                _h = int(now) % 86400 // 3600
+                state['hourly_events'][_h] += len(old_set - new_set) + len(new_set - old_set)
+                interval = _server_tier(state)[0]
                 for fkey in old_set - new_set:
                     state['first_seen'].pop(fkey, None)
                     state['last_absent'].pop(fkey, None)
             elif result['nclients'] > 0:
-                interval = _current_rates()[1]
+                interval = _server_tier(state)[1]
             else:
-                interval = _current_rates()[2]
+                interval = _server_tier(state)[2]
 
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
@@ -899,7 +896,7 @@ class Handler(BaseHTTPRequestHandler):
                 n_reachable = sum(1 for s in SERVER_STATE.values() if s['ping'] >= 0)
                 n_clients   = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
                 n_active    = sum(1 for s in SERVER_STATE.values()
-                                  if s['ping'] >= 0 and s['last_changed'] > now_s - _current_rates()[0] * 2)
+                                  if s['ping'] >= 0 and s['last_changed'] > now_s - 8.0)
                 n_inflight  = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
                 dirs_info = [
                     {
@@ -949,14 +946,11 @@ class Handler(BaseHTTPRequestHandler):
                 'directories':          dirs_info,
                 'unreachable_servers':  unreachable_servers,
                 'activity': {
-                    'tier':    _activity_tier,
-                    'p33':     _activity_p33,
-                    'p67':     _activity_p67,
-                    'samples': len(_activity_history),
-                    'rates':   dict(zip(
-                        ('probe_active', 'probe_stable', 'probe_idle'),
-                        _current_rates(),
-                    )),
+                    t: sum(
+                        1 for sv in SERVER_STATE.values()
+                        if _server_tier(sv) == _TIER_RATES[t]
+                    )
+                    for t in ('quiet', 'normal', 'busy')
                 },
             })
             return
@@ -989,7 +983,7 @@ class Handler(BaseHTTPRequestHandler):
                 ip_port for ip_port in ds.get('servers', [])
                 if ip_port in SERVER_STATE
                 and SERVER_STATE[ip_port]['nclients'] == 0
-                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _current_rates()[2]
+                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _server_tier(SERVER_STATE[ip_port])[2]
                 and SERVER_STATE[ip_port]['_min_probe'] <= now_req
             ]
 
