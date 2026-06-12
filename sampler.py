@@ -635,6 +635,7 @@ def _do_dir_task(dir_key: str):
                     'ping': -1, 'nclients': 0, 'clients': [],
                     'first_seen': {}, 'last_absent': {}, 'last_changed': 0.0,
                     'hourly_events': [0] * 24,
+                    '_cooldown': 0,
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
                     '_last_sweep_success': 0.0,
@@ -733,6 +734,7 @@ def _do_srv_task(srv_key: str):
         with _STATE_LOCK:
             if ip_port in SERVER_STATE:
                 _idle = _server_tier(SERVER_STATE[ip_port])[2]
+                SERVER_STATE[ip_port]['_cooldown'] = 0
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
                 SERVER_STATE[ip_port]['_probe_inflight'] = False
             else:
@@ -757,9 +759,10 @@ def _do_srv_task(srv_key: str):
         if result is None:
             if not sweep_fresh:
                 state['ping'] = -1
-            # Empty server with flaky 1002: retry at stable rate to catch new clients faster
             rates = _server_tier(state)
-            interval = rates[1] if state['nclients'] > 0 else rates[2]
+            cap = rates[1] if state['nclients'] > 0 else rates[2]
+            state['_cooldown'] = min(state['_cooldown'] + 1, 20)
+            interval = min(4.0 + state['_cooldown'], cap)
         else:
             # Only overwrite sweep-obtained data when the probe actually got a response.
             # A failed probe (ping=-1) from pool ports cannot reach NAT-strict servers;
@@ -787,14 +790,17 @@ def _do_srv_task(srv_key: str):
                 state['last_changed'] = now
                 _h = int(now) % 86400 // 3600
                 state['hourly_events'][_h] += len(old_set - new_set) + len(new_set - old_set)
+                state['_cooldown'] = 0
                 interval = _server_tier(state)[0]
                 for fkey in old_set - new_set:
                     state['first_seen'].pop(fkey, None)
                     state['last_absent'].pop(fkey, None)
             elif result['nclients'] > 0:
-                interval = _server_tier(state)[1]
+                state['_cooldown'] = min(state['_cooldown'] + 1, 20)
+                interval = min(4.0 + state['_cooldown'], _server_tier(state)[1])
             else:
-                interval = _server_tier(state)[2]
+                state['_cooldown'] = min(state['_cooldown'] + 1, 20)
+                interval = min(4.0 + state['_cooldown'], _server_tier(state)[2])
 
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
