@@ -23,6 +23,7 @@ from urllib.parse import parse_qs, urlparse
 
 CLIENT_PORT_START = 22135
 CLIENT_PORT_RANGE = 15
+SWEEP_PORT        = 22134   # fixed sweep socket port — same as servers.php CLIENT_PORT
 TIMEOUT_SEC       = 0.5
 MAX_ATTEMPTS      = 3
 
@@ -209,7 +210,7 @@ def parse_version(s: str):
     vsort = f"{int(m.group(2)):03d}{int(m.group(3)):03d}{int(m.group(4)):03d}{k}{suffix}"
     return ver, vsort
 
-# ── Port pool — each probe holds one port from 22134–22149 ────────────────────
+# ── Port pool — each probe holds one port from 22135–22149 ────────────────────
 
 _port_pool    = list(range(CLIENT_PORT_START, CLIENT_PORT_START + CLIENT_PORT_RANGE))
 _port_lock    = threading.Lock()
@@ -232,6 +233,15 @@ def _release_port(p: int):
         _port_pool.append(p)
         _ports_in_use -= 1
     _port_sem.release()
+
+# ── Persistent sweep socket (port 22134, same as servers.php CLIENT_PORT) ─────
+# All directory sweeps share this one socket so NAT hole-punches persist across
+# the 90s sweep interval. Sweeps are serialized via _sweep_lock.
+
+_sweep_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_sweep_sock.bind(('0.0.0.0', SWEEP_PORT))
+_sweep_sock.settimeout(TIMEOUT_SEC)
+_sweep_lock = threading.Lock()
 
 # ── Packet parsing helpers ────────────────────────────────────────────────────
 
@@ -288,23 +298,25 @@ def sweep_directory(host: str, port: int):
     except socket.gaierror as e:
         return None, None, str(e)
 
-    lport = _acquire_port()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(TIMEOUT_SEC)
-    try:
-        sock.bind(('0.0.0.0', lport))
+    with _sweep_lock:
+        sock = _sweep_sock
 
-        # Phase 1: get server list from directory
+        # Phase 1: get server list from directory.
+        # Buffer any 1002 pings that arrive while waiting for 1006 — the directory
+        # introduction can trigger server pings before we receive the server list.
         server_list = None
+        phase1_buffered = []   # (data, addr) pairs received before 1006 arrived
         for _ in range(MAX_ATTEMPTS):
             sock.sendto(build_packet(CLM_REQ_SERVER_LIST), (ip, port))
             try:
                 while True:
-                    data, _ = sock.recvfrom(32767)
+                    data, addr = sock.recvfrom(32767)
                     parsed = parse_header(data)
                     if parsed and parsed[0] == CLM_SERVER_LIST:
                         server_list = _parse_server_list(parsed[2], ip, port)
                         break
+                    elif parsed:
+                        phase1_buffered.append((parsed, addr))
             except socket.timeout:
                 pass
             if server_list is not None:
@@ -314,43 +326,72 @@ def sweep_directory(host: str, port: int):
             return None, None, f"no response from {host}:{port} after {MAX_ATTEMPTS} attempts"
 
         # Phase 2: collect server-initiated pings. The directory has now notified each
-        # registered server to send CLM_PING_MS_WITHNUMCLIENTS to our lport — that exchange
-        # opens the firewall path. Receive those pings and request client lists on the same socket.
+        # registered server to send CLM_PING_MS_WITHNUMCLIENTS to our fixed sweep port — that
+        # exchange opens the NAT hole-punch path.
+        #
+        # Two-ping protocol (matches servers.php): on the FIRST hole-punch ping we send a
+        # ping back to the server so it sees bidirectional traffic; on the SECOND response
+        # we send 1014. This is required for servers behind strict NAT — our outbound 1014
+        # would be blocked if we skip the return ping.
         server_keys = {f"{s['ip']}:{s['port']}" for s in server_list}
         probe_results = {}   # ip:port → {ping, nclients, clients}
+        first_ping_sent = set()   # keys where we sent a return ping (awaiting 2nd response)
         clients_requested = set()
+        ms = int(time.time() * 1000) % 86400000
+        return_ping = build_packet(CLM_PING_MS_WITHNUMCLIENTS, struct.pack('<IB', ms, 0))
+
+        def _process_p2_packet(parsed, fip, fport):
+            """Process one Phase 2 packet in-place (modifies probe_results etc.)."""
+            mid, _, payload = parsed
+            key = f"{fip}:{fport}"
+            if key not in server_keys:
+                return
+            if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
+                timems_r, nclients = struct.unpack_from('<IB', payload)
+                now_ms = int(time.time() * 1000) % 86400000
+                rtt = now_ms - timems_r
+                if key not in first_ping_sent:
+                    probe_results[key] = {'ping': 0, 'nclients': nclients, 'clients': []}
+                    sock.sendto(return_ping, (fip, fport))
+                    first_ping_sent.add(key)
+                    if nclients > 0:
+                        print(f'[sweep] {host}:{port} 1st ping from {key} nclients={nclients} sent_return_ping', file=sys.stderr, flush=True)
+                else:
+                    probe_results[key]['ping'] = rtt if 0 <= rtt < 30000 else 0
+                    probe_results[key]['nclients'] = nclients
+                    if nclients > 0 and key not in clients_requested:
+                        sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
+                        clients_requested.add(key)
+                        print(f'[sweep] {host}:{port} 2nd ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
+            elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
+                probe_results[key]['clients'] = _parse_client_list(payload)
+                print(f'[sweep] {host}:{port} got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
+
+        # Replay pings buffered during Phase 1 before entering the live receive loop.
+        for parsed_buf, (bip, bport) in phase1_buffered:
+            _process_p2_packet(parsed_buf, bip, bport)
 
         deadline = time.time() + TIMEOUT_SEC
+        if clients_requested:
+            deadline = max(deadline, time.time() + TIMEOUT_SEC * MAX_ATTEMPTS)
         while time.time() < deadline:
             try:
                 data, (fip, fport) = sock.recvfrom(32767)
                 parsed = parse_header(data)
-                if not parsed:
-                    continue
-                mid, _, payload = parsed
-                key = f"{fip}:{fport}"
-                if key not in server_keys:
-                    continue
-
-                if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
-                    timems_r, nclients = struct.unpack_from('<IB', payload)
-                    now_ms = int(time.time() * 1000) % 86400000
-                    rtt = now_ms - timems_r
-                    if key not in probe_results:
-                        probe_results[key] = {'ping': rtt if 0 <= rtt < 30000 else 0,
-                                              'nclients': nclients, 'clients': []}
-                    else:
-                        probe_results[key]['nclients'] = nclients
-                    if nclients > 0 and key not in clients_requested:
-                        sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
-                        clients_requested.add(key)
-
-                elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
-                    probe_results[key]['clients'] = _parse_client_list(payload)
-
+                if parsed:
+                    prev_req = len(clients_requested)
+                    _process_p2_packet(parsed, fip, fport)
+                    if len(clients_requested) > prev_req:
+                        deadline = max(deadline, time.time() + TIMEOUT_SEC * MAX_ATTEMPTS)
+                    elif fip + ':' + str(fport) in first_ping_sent - clients_requested:
+                        deadline = max(deadline, time.time() + TIMEOUT_SEC)
             except socket.timeout:
-                if len(probe_results) >= len(server_list):
-                    break  # heard from all servers, done early
+                clients_pending = any(
+                    not probe_results[k]['clients']
+                    for k in clients_requested if k in probe_results
+                )
+                if len(probe_results) >= len(server_list) and not clients_pending:
+                    break  # heard from all servers and all pending 1013s collected
 
         # Phase 3: active probe for servers that didn't ping back during the passive window.
         # Send CLM_PING from this same socket (same source port the directory advertised to
@@ -376,9 +417,11 @@ def sweep_directory(host: str, port: int):
                         continue
                     mid, _, payload = parsed
                     key = f"{fip}:{fport}"
-                    if key not in server_keys or key in probe_results:
+                    if key not in server_keys:
                         continue
                     if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
+                        if key in probe_results:
+                            continue  # already have this server's ping
                         timems_r, nclients = struct.unpack_from('<IB', payload)
                         now_ms = int(time.time() * 1000) % 86400000
                         rtt = now_ms - timems_r
@@ -387,15 +430,20 @@ def sweep_directory(host: str, port: int):
                         if nclients > 0 and key not in clients_requested:
                             sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
                             clients_requested.add(key)
+                            deadline = max(deadline, time.time() + TIMEOUT_SEC * MAX_ATTEMPTS)
+                            print(f'[sweep] {host}:{port} phase3 ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
                     elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
                         probe_results[key]['clients'] = _parse_client_list(payload)
+                        print(f'[sweep] {host}:{port} phase3 got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
                 except socket.timeout:
-                    break
+                    clients_pending = any(
+                        not probe_results[k]['clients']
+                        for k in clients_requested if k in probe_results
+                    )
+                    if not clients_pending:
+                        break
 
         return server_list, probe_results, None
-    finally:
-        sock.close()
-        _release_port(lport)
 
 
 def probe_server(ip: str, port: int):
@@ -677,19 +725,23 @@ def _do_srv_task(srv_key: str):
             # Empty server with flaky 1002: retry at PROBE_STABLE to catch new clients faster
             interval = PROBE_STABLE if state['nclients'] > 0 else PROBE_DORMANT
         else:
-            # Only overwrite a sweep-obtained ping with a failure if the sweep is stale
-            if result['ping'] >= 0 or not sweep_fresh:
+            # Only overwrite sweep-obtained data when the probe actually got a response.
+            # A failed probe (ping=-1) from pool ports cannot reach NAT-strict servers;
+            # don't clobber nclients/clients that the sweep correctly obtained.
+            probe_ok = result['ping'] >= 0
+            if probe_ok or not sweep_fresh:
                 state['ping'] = result['ping']
-            state['nclients']    = result['nclients']
-            state['os']          = result['os']
-            state['version']     = result['version']
-            state['versionsort'] = result['versionsort']
+            if probe_ok or not sweep_fresh:
+                state['nclients']    = result['nclients']
+                state['os']          = result['os']
+                state['version']     = result['version']
+                state['versionsort'] = result['versionsort']
 
             old_set = frozenset(
                 (c['name'], c['countryid'], c['instrumentid'], c['city'])
                 for c in state['clients']
             )
-            new_clients = result['clients']
+            new_clients = result['clients'] if (probe_ok or not sweep_fresh) else state['clients']
             new_set = frozenset(
                 (c['name'], c['countryid'], c['instrumentid'], c['city'])
                 for c in new_clients
