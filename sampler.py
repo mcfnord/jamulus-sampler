@@ -38,7 +38,7 @@ CLM_REQ_CONN_CLIENTS_LIST   = 1014
 PROBE_ACTIVE    =   3.0   # s — after client-set change
 PROBE_STABLE    =  15.0   # s — clients present, stable
 PROBE_IDLE      =  60.0   # s — no clients (recently emptied or recently requested)
-PROBE_DORMANT   =  60.0   # s — no clients (same floor as PROBE_IDLE; was 600s)
+PROBE_DORMANT   =  30.0   # s — no clients (was 600s, then 60s)
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -649,6 +649,9 @@ def _do_dir_task(dir_key: str):
             )
             if new_set != old_set:
                 ss['last_changed'] = now
+                for fkey in old_set - new_set:
+                    ss['first_seen'].pop(fkey, None)
+                    ss['last_absent'].pop(fkey, None)
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
                 if fkey not in ss['first_seen']:
@@ -750,6 +753,9 @@ def _do_srv_task(srv_key: str):
             if new_set != old_set:
                 state['last_changed'] = now
                 interval = PROBE_ACTIVE
+                for fkey in old_set - new_set:
+                    state['first_seen'].pop(fkey, None)
+                    state['last_absent'].pop(fkey, None)
             elif result['nclients'] > 0:
                 interval = PROBE_STABLE
             else:
