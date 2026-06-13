@@ -10,7 +10,7 @@ systemctl restart jamulus-sampler.service  # restart
 journalctl -u jamulus-sampler.service -n 100  # recent logs
 ```
 
-Runs on port **5001**. Do not change the port — `servers.php` owns port 80 and stays untouched until M3 cutover is validated.
+Runs on port **5001**. `servers.php` on port 80 remains as a rollback path.
 
 ## Endpoints
 
@@ -65,7 +65,6 @@ python3 /root/compare-samplers.py --interval 5
 
 ## Deployment context
 
-- Replaces `/var/www/html/servers.php` as the Layer 1 data source for `gather-server-data.py` on jamfan26.
-- Cutover (M3): edit `ips-from-joins/gather-server-data.py` line 9 on jamfan26, change `BASE_URL` from `http://137.184.43.255/servers.php?central=` to `http://137.184.43.255:5001/servers?central=`, then `systemctl restart call-servers-php.service`.
-- Rollback: revert that one line + restart. ~30 seconds, no data loss.
+- **M3 live (2026-06-10)**: active Layer 1 data source for `gather-server-data.py` on jamfan26 (24.199.107.192). `BASE_URL` already points to `http://137.184.43.255:5001/servers?central=`.
+- Rollback if needed: change `BASE_URL` back to `http://137.184.43.255/servers.php?central=`, then `systemctl restart call-servers-php.service` on jamfan26. ~30 seconds, no data loss.
 - GitHub: `https://github.com/mcfnord/jamulus-sampler`
