@@ -41,6 +41,8 @@ _TIER_RATES = {
     "normal": (4.0,  8.0, 15.0),
     "busy":   (4.0,  6.0, 10.0),
 }
+GLOBAL_NORMAL_CLIENTS = 20   # servers with clients → normal global idle tier
+GLOBAL_BUSY_CLIENTS   = 50   # servers with clients → busy global idle tier
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -580,6 +582,15 @@ def _server_tier(ss):
     else:
         return _TIER_RATES["normal"]
 
+def _global_idle_cap_locked() -> float:
+    """Max PROBE_IDLE for idle servers based on global activity. Caller must hold _STATE_LOCK."""
+    n = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
+    if n >= GLOBAL_BUSY_CLIENTS:
+        return _TIER_RATES['busy'][2]    # 10s
+    elif n >= GLOBAL_NORMAL_CLIENTS:
+        return _TIER_RATES['normal'][2]  # 15s
+    return _TIER_RATES['quiet'][2]       # 20s
+
 def _schedule(when: float, key: str):
     global _heap_cnt
     with _heap_lock:
@@ -733,7 +744,7 @@ def _do_srv_task(srv_key: str):
         print(f'[srv] {ip}:{port} probe exception: {exc}', file=sys.stderr, flush=True)
         with _STATE_LOCK:
             if ip_port in SERVER_STATE:
-                _idle = _server_tier(SERVER_STATE[ip_port])[2]
+                _idle = _global_idle_cap_locked()
                 SERVER_STATE[ip_port]['_cooldown'] = 0
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
                 SERVER_STATE[ip_port]['_probe_inflight'] = False
@@ -760,7 +771,7 @@ def _do_srv_task(srv_key: str):
             if not sweep_fresh:
                 state['ping'] = -1
             rates = _server_tier(state)
-            cap = rates[1] if state['nclients'] > 0 else rates[2]
+            cap = rates[1] if state['nclients'] > 0 else _global_idle_cap_locked()
             state['_cooldown'] = min(state['_cooldown'] + 1, 20)
             interval = min(4.0 + state['_cooldown'], cap)
         else:
@@ -800,7 +811,7 @@ def _do_srv_task(srv_key: str):
                 interval = min(4.0 + state['_cooldown'], _server_tier(state)[1])
             else:
                 state['_cooldown'] = min(state['_cooldown'] + 1, 20)
-                interval = min(4.0 + state['_cooldown'], _server_tier(state)[2])
+                interval = min(4.0 + state['_cooldown'], _global_idle_cap_locked())
 
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
@@ -834,6 +845,11 @@ def _scheduler_loop():
                     state['_probe_inflight'] = True
                 _tasks_submitted += 1
                 _executor.submit(_do_srv_task, key)
+        with _STATE_LOCK:
+            _n_inf = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
+            _n_tot = len(SERVER_STATE)
+        if _n_inf == _n_tot > 100:
+            print(f'[watchdog] ALL {_n_inf}/{_n_tot} servers stuck inflight', file=sys.stderr, flush=True)
         sleep = max(0.05, min(_heap_next_time() - time.time(), 1.0))
         time.sleep(sleep)
 
@@ -901,6 +917,9 @@ class Handler(BaseHTTPRequestHandler):
                 n_total     = len(SERVER_STATE)
                 n_reachable = sum(1 for s in SERVER_STATE.values() if s['ping'] >= 0)
                 n_clients   = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
+                global_tier = ('busy'   if n_clients >= GLOBAL_BUSY_CLIENTS   else
+                               'normal' if n_clients >= GLOBAL_NORMAL_CLIENTS else
+                               'quiet')
                 n_active    = sum(1 for s in SERVER_STATE.values()
                                   if s['ping'] >= 0 and s['last_changed'] > now_s - 8.0)
                 n_inflight  = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
@@ -940,6 +959,7 @@ class Handler(BaseHTTPRequestHandler):
                     'reachable':    n_reachable,
                     'unreachable':  n_total - n_reachable,
                     'with_clients': n_clients,
+                    'global_tier':  global_tier,
                     'active_tier':  n_active,
                 },
                 'probes': {
@@ -961,6 +981,17 @@ class Handler(BaseHTTPRequestHandler):
             })
             return
 
+        if p.path == '/debug/stuck':
+            with _STATE_LOCK:
+                stuck = [
+                    {'ip_port': k, 'name': s['name'],
+                     'nclients': s['nclients'], 'ping': s['ping']}
+                    for k, s in SERVER_STATE.items()
+                    if s.get('_probe_inflight')
+                ]
+            self._send(200, {'stuck_count': len(stuck), 'servers': stuck})
+            return
+
         if p.path != '/servers':
             self._send(404, {'error': 'not found'}); return
 
@@ -980,16 +1011,16 @@ class Handler(BaseHTTPRequestHandler):
         with _STATE_LOCK:
             ds = DIRECTORY_STATE.get(host_port)
             if ds is None:
-                _schedule(now_req, dir_key)
                 self._send(200, [])
                 return
             ds['last_request_time'] = now_req
             result = _build_dir_rows(host_port, ds)
+            _idle_cap = _global_idle_cap_locked()
             servers_to_poke = [
                 ip_port for ip_port in ds.get('servers', [])
                 if ip_port in SERVER_STATE
                 and SERVER_STATE[ip_port]['nclients'] == 0
-                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _server_tier(SERVER_STATE[ip_port])[2]
+                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _idle_cap
                 and SERVER_STATE[ip_port]['_min_probe'] <= now_req
             ]
 
