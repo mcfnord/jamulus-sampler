@@ -41,8 +41,8 @@ _TIER_RATES = {
     "normal": (4.0,  8.0, 15.0),
     "busy":   (4.0,  6.0, 10.0),
 }
-GLOBAL_NORMAL_CLIENTS = 20   # servers with clients → normal global idle tier
-GLOBAL_BUSY_CLIENTS   = 50   # servers with clients → busy global idle tier
+GLOBAL_NORMAL_TOTAL = 60    # total clients across all servers → normal global idle tier
+GLOBAL_BUSY_TOTAL   = 150   # total clients across all servers → busy global idle tier
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -584,10 +584,10 @@ def _server_tier(ss):
 
 def _global_idle_cap_locked() -> float:
     """Max PROBE_IDLE for idle servers based on global activity. Caller must hold _STATE_LOCK."""
-    n = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
-    if n >= GLOBAL_BUSY_CLIENTS:
+    n = sum(s['nclients'] for s in SERVER_STATE.values())
+    if n >= GLOBAL_BUSY_TOTAL:
         return _TIER_RATES['busy'][2]    # 10s
-    elif n >= GLOBAL_NORMAL_CLIENTS:
+    elif n >= GLOBAL_NORMAL_TOTAL:
         return _TIER_RATES['normal'][2]  # 15s
     return _TIER_RATES['quiet'][2]       # 20s
 
@@ -916,10 +916,11 @@ class Handler(BaseHTTPRequestHandler):
             with _STATE_LOCK:
                 n_total     = len(SERVER_STATE)
                 n_reachable = sum(1 for s in SERVER_STATE.values() if s['ping'] >= 0)
-                n_clients   = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
-                global_tier = ('busy'   if n_clients >= GLOBAL_BUSY_CLIENTS   else
-                               'normal' if n_clients >= GLOBAL_NORMAL_CLIENTS else
-                               'quiet')
+                n_clients     = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
+                total_clients = sum(s['nclients'] for s in SERVER_STATE.values())
+                global_tier   = ('busy'   if total_clients >= GLOBAL_BUSY_TOTAL   else
+                                 'normal' if total_clients >= GLOBAL_NORMAL_TOTAL else
+                                 'quiet')
                 n_active    = sum(1 for s in SERVER_STATE.values()
                                   if s['ping'] >= 0 and s['last_changed'] > now_s - 8.0)
                 n_inflight  = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
@@ -958,8 +959,9 @@ class Handler(BaseHTTPRequestHandler):
                     'total':        n_total,
                     'reachable':    n_reachable,
                     'unreachable':  n_total - n_reachable,
-                    'with_clients': n_clients,
-                    'global_tier':  global_tier,
+                    'with_clients':  n_clients,
+                    'total_clients': total_clients,
+                    'global_tier':   global_tier,
                     'active_tier':  n_active,
                 },
                 'probes': {
