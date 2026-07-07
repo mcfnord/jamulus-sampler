@@ -41,8 +41,8 @@ _TIER_RATES = {
     "normal": (4.0,  8.0, 15.0),
     "busy":   (4.0,  6.0, 10.0),
 }
-GLOBAL_NORMAL_TOTAL = 60    # total clients across all servers → normal global idle tier
-GLOBAL_BUSY_TOTAL   = 150   # total clients across all servers → busy global idle tier
+GLOBAL_NORMAL_POOL = 8     # unique browser IPs in last 180s → normal global idle tier
+GLOBAL_BUSY_POOL   = 15    # unique browser IPs in last 180s → busy global idle tier
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -587,13 +587,20 @@ def _server_tier(ss):
         return _TIER_RATES["normal"]
 
 def _global_idle_cap_locked() -> float:
-    """Max PROBE_IDLE for idle servers based on global activity. Caller must hold _STATE_LOCK."""
-    n = sum(s['nclients'] for s in SERVER_STATE.values())
-    if n >= GLOBAL_BUSY_TOTAL:
+    """Max PROBE_IDLE for idle servers based on global ping-browser activity. Caller must hold _STATE_LOCK."""
+    n = _active_pool
+    if n >= GLOBAL_BUSY_POOL:
         return _TIER_RATES['busy'][2]    # 10s
-    elif n >= GLOBAL_NORMAL_TOTAL:
+    elif n >= GLOBAL_NORMAL_POOL:
         return _TIER_RATES['normal'][2]  # 15s
     return _TIER_RATES['quiet'][2]       # 20s
+
+def _server_idle_cap_locked(state) -> float:
+    """Per-server idle cap: historically-quiet servers are not tightened by global activity."""
+    ps_idle = _server_tier(state)[2]
+    if ps_idle >= 20.0:
+        return ps_idle
+    return min(ps_idle, _global_idle_cap_locked())
 
 def _schedule(when: float, key: str):
     global _heap_cnt
@@ -748,7 +755,7 @@ def _do_srv_task(srv_key: str):
         print(f'[srv] {ip}:{port} probe exception: {exc}', file=sys.stderr, flush=True)
         with _STATE_LOCK:
             if ip_port in SERVER_STATE:
-                _idle = _global_idle_cap_locked()
+                _idle = _server_idle_cap_locked(SERVER_STATE[ip_port])
                 SERVER_STATE[ip_port]['_cooldown'] = 0
                 SERVER_STATE[ip_port]['_min_probe'] = 0.0
                 SERVER_STATE[ip_port]['_probe_inflight'] = False
@@ -775,7 +782,7 @@ def _do_srv_task(srv_key: str):
             if not sweep_fresh:
                 state['ping'] = -1
             rates = _server_tier(state)
-            cap = rates[1] if state['nclients'] > 0 else _global_idle_cap_locked()
+            cap = rates[1] if state['nclients'] > 0 else _server_idle_cap_locked(state)
             state['_cooldown'] = min(state['_cooldown'] + 1, 20)
             interval = min(4.0 + state['_cooldown'], cap)
         else:
@@ -815,7 +822,7 @@ def _do_srv_task(srv_key: str):
                 interval = min(4.0 + state['_cooldown'], _server_tier(state)[1])
             else:
                 state['_cooldown'] = min(state['_cooldown'] + 1, 20)
-                interval = min(4.0 + state['_cooldown'], _global_idle_cap_locked())
+                interval = min(4.0 + state['_cooldown'], _server_idle_cap_locked(state))
 
             for c in new_clients:
                 fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
