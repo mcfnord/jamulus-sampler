@@ -559,6 +559,10 @@ _probes_total    = 0
 _probes_t0       = time.time()   # set at startup
 _tasks_submitted = 0   # total srv tasks dispatched to executor (including early-exit ones)
 
+# Ping-density signal pushed from gather-server-data.py every ~60s
+_active_pool:    int   = 0    # unique ALLOWED client IPs seen in last 180s
+_active_pool_ts: float = 0.0  # Unix timestamp of last push
+
 # ── Activity tier (global probe-rate calibration) ─────────────────────────────────────
 
 def _server_tier(ss):
@@ -918,9 +922,6 @@ class Handler(BaseHTTPRequestHandler):
                 n_reachable = sum(1 for s in SERVER_STATE.values() if s['ping'] >= 0)
                 n_clients     = sum(1 for s in SERVER_STATE.values() if s['nclients'] > 0)
                 total_clients = sum(s['nclients'] for s in SERVER_STATE.values())
-                global_tier   = ('busy'   if total_clients >= GLOBAL_BUSY_TOTAL   else
-                                 'normal' if total_clients >= GLOBAL_NORMAL_TOTAL else
-                                 'quiet')
                 n_active    = sum(1 for s in SERVER_STATE.values()
                                   if s['ping'] >= 0 and s['last_changed'] > now_s - 8.0)
                 n_inflight  = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
@@ -959,10 +960,11 @@ class Handler(BaseHTTPRequestHandler):
                     'total':        n_total,
                     'reachable':    n_reachable,
                     'unreachable':  n_total - n_reachable,
-                    'with_clients':  n_clients,
-                    'total_clients': total_clients,
-                    'global_tier':   global_tier,
-                    'active_tier':  n_active,
+                    'with_clients':    n_clients,
+                    'total_clients':   total_clients,
+                    'active_tier':     n_active,
+                    'active_pool':     _active_pool,
+                    'active_pool_age_s': round(time.time() - _active_pool_ts, 1) if _active_pool_ts else None,
                 },
                 'probes': {
                     'submitted':  _tasks_submitted,
@@ -1033,6 +1035,22 @@ class Handler(BaseHTTPRequestHandler):
             _schedule(now_req, f'srv:{ip_port}')
 
         self._send(200, result)
+
+    def do_POST(self):
+        p = urlparse(self.path)
+        if p.path == '/ping-density':
+            global _active_pool, _active_pool_ts
+            length = int(self.headers.get('Content-Length', 0))
+            body   = self.rfile.read(length)
+            try:
+                d = json.loads(body)
+                _active_pool    = int(d['active_pool'])
+                _active_pool_ts = float(d.get('ts', time.time()))
+                self._send(200, {'ok': True, 'active_pool': _active_pool})
+            except Exception as exc:
+                self._send(400, {'error': str(exc)})
+            return
+        self._send(404, {'error': 'not found'})
 
     def _send(self, code, data):
         body = (json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
