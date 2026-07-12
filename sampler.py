@@ -562,6 +562,7 @@ _tasks_submitted = 0   # total srv tasks dispatched to executor (including early
 # Ping-density signal pushed from gather-server-data.py every ~60s
 _active_pool:    int   = 0    # unique ALLOWED client IPs seen in last 180s
 _active_pool_ts: float = 0.0  # Unix timestamp of last push
+_today_peak: list = [0] * 24  # max active_pool seen per UTC hour today (index = hour)
 
 # ── Activity tier (global probe-rate calibration) ─────────────────────────────────────
 
@@ -972,6 +973,7 @@ class Handler(BaseHTTPRequestHandler):
                     'active_tier':     n_active,
                     'active_pool':     _active_pool,
                     'active_pool_age_s': round(time.time() - _active_pool_ts, 1) if _active_pool_ts else None,
+                    'today_peak':      list(_today_peak),
                 },
                 'probes': {
                     'submitted':  _tasks_submitted,
@@ -1046,13 +1048,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         p = urlparse(self.path)
         if p.path == '/ping-density':
-            global _active_pool, _active_pool_ts
+            global _active_pool, _active_pool_ts, _today_peak
             length = int(self.headers.get('Content-Length', 0))
             body   = self.rfile.read(length)
             try:
                 d = json.loads(body)
                 _active_pool    = int(d['active_pool'])
                 _active_pool_ts = float(d.get('ts', time.time()))
+                h = time.gmtime(_active_pool_ts).tm_hour
+                if _active_pool > _today_peak[h]:
+                    _today_peak[h] = _active_pool
                 self._send(200, {'ok': True, 'active_pool': _active_pool})
             except Exception as exc:
                 self._send(400, {'error': str(exc)})
