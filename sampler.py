@@ -562,7 +562,8 @@ _tasks_submitted = 0   # total srv tasks dispatched to executor (including early
 # Ping-density signal pushed from gather-server-data.py every ~60s
 _active_pool:    int   = 0    # unique ALLOWED client IPs seen in last 180s
 _active_pool_ts: float = 0.0  # Unix timestamp of last push
-_today_peak: list = [0] * 24  # max active_pool seen per UTC hour today (index = hour)
+_today_peak:     list = [0] * 24  # max active_pool seen per UTC hour today (index = hour)
+_yesterday_peak: list = [0] * 24  # _today_peak from the previous UTC day
 
 # ── Activity tier (global probe-rate calibration) ─────────────────────────────────────
 
@@ -974,6 +975,7 @@ class Handler(BaseHTTPRequestHandler):
                     'active_pool':     _active_pool,
                     'active_pool_age_s': round(time.time() - _active_pool_ts, 1) if _active_pool_ts else None,
                     'today_peak':      list(_today_peak),
+                    'yesterday_peak':  list(_yesterday_peak),
                 },
                 'probes': {
                     'submitted':  _tasks_submitted,
@@ -1075,6 +1077,18 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} - {fmt % args}", file=sys.stderr, flush=True)
 
+def _midnight_rollover_loop():
+    """At each UTC midnight, roll _today_peak into _yesterday_peak and reset."""
+    global _yesterday_peak, _today_peak
+    while True:
+        now_gm = time.gmtime()
+        secs_until_midnight = (23 - now_gm.tm_hour) * 3600 + (59 - now_gm.tm_min) * 60 + (60 - now_gm.tm_sec)
+        time.sleep(secs_until_midnight + 1)
+        with _STATE_LOCK:
+            _yesterday_peak = list(_today_peak)
+            _today_peak = [0] * 24
+        print(f"[MIDNIGHT_ROLLOVER] yesterday_peak={_yesterday_peak}", flush=True)
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
@@ -1083,6 +1097,7 @@ if __name__ == '__main__':
     for d in DIRECTORIES:
         _schedule(now, f"dir:{d}")
     threading.Thread(target=_scheduler_loop, daemon=True, name='scheduler').start()
+    threading.Thread(target=_midnight_rollover_loop, daemon=True, name='midnight-rollover').start()
     srv = HTTPServer(('0.0.0.0', 5001), Handler)
     print('jamulus-sampler daemon on :5001', flush=True)
     srv.serve_forever()
