@@ -41,8 +41,8 @@ _TIER_RATES = {
     "normal": (4.0,  8.0, 15.0),
     "busy":   (4.0,  6.0, 10.0),
 }
-GLOBAL_NORMAL_POOL = 8     # unique browser IPs in last 180s → normal global idle tier
-GLOBAL_BUSY_POOL   = 15    # unique browser IPs in last 180s → busy global idle tier
+GLOBAL_NORMAL_PERCENTILE = 90  # active_pool above this percentile of yesterday → normal idle cap
+GLOBAL_BUSY_PERCENTILE   = 98  # active_pool above this percentile of yesterday → busy idle cap
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
@@ -588,12 +588,25 @@ def _server_tier(ss):
     else:
         return _TIER_RATES["normal"]
 
+def _pool_threshold_locked(pct: float) -> int:
+    """Value at given percentile of _yesterday_peak. Returns 0 if no data. Caller must hold _STATE_LOCK."""
+    vals = sorted(_yesterday_peak)
+    if not any(vals):
+        return 0
+    idx = (pct / 100.0) * (len(vals) - 1)
+    lo, hi = int(idx), min(int(idx) + 1, len(vals) - 1)
+    return round(vals[lo] + (vals[hi] - vals[lo]) * (idx - lo))
+
 def _global_idle_cap_locked() -> float:
-    """Max PROBE_IDLE for idle servers based on global ping-browser activity. Caller must hold _STATE_LOCK."""
+    """Max PROBE_IDLE for idle servers based on active_pool vs yesterday's percentile profile. Caller must hold _STATE_LOCK."""
+    busy_thresh   = _pool_threshold_locked(GLOBAL_BUSY_PERCENTILE)
+    normal_thresh = _pool_threshold_locked(GLOBAL_NORMAL_PERCENTILE)
+    if not any(_yesterday_peak):
+        return _TIER_RATES['quiet'][2]   # no calibration data yet → stay quiet
     n = _active_pool
-    if n >= GLOBAL_BUSY_POOL:
+    if busy_thresh > 0 and n >= busy_thresh:
         return _TIER_RATES['busy'][2]    # 10s
-    elif n >= GLOBAL_NORMAL_POOL:
+    if normal_thresh > 0 and n >= normal_thresh:
         return _TIER_RATES['normal'][2]  # 15s
     return _TIER_RATES['quiet'][2]       # 20s
 
@@ -976,6 +989,8 @@ class Handler(BaseHTTPRequestHandler):
                     'active_pool_age_s': round(time.time() - _active_pool_ts, 1) if _active_pool_ts else None,
                     'today_peak':      list(_today_peak),
                     'yesterday_peak':  list(_yesterday_peak),
+                    'pool_normal_thresh': _pool_threshold_locked(GLOBAL_NORMAL_PERCENTILE),
+                    'pool_busy_thresh':   _pool_threshold_locked(GLOBAL_BUSY_PERCENTILE),
                 },
                 'probes': {
                     'submitted':  _tasks_submitted,
