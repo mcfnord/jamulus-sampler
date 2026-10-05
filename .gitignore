@@ -1,1 +1,23 @@
-*.pyc\n__pycache__/\n*.log\n.env
+# Python
+*.pyc
+__pycache__/
+
+# Logs and stderr sinks. tier-poll.err is the cron stderr target for tier-poll.sh
+# (`* * * * * .../tier-poll.sh 2>>.../tier-poll.err`), so it is a runtime artifact,
+# not source. Empty is the healthy state.
+*.log
+*.err
+
+# Secrets
+.env
+
+# Ad-hoc pre-edit copies. History belongs in git, not in .bak files.
+# NOTE: sampler.py.bak (2026-06-12) does NOT match any committed version, so it is
+# the only copy of that state - ignore it here, but do not delete it blindly.
+*.bak
+
+# Measurement data. The standing rule across this fleet is: scripts and write-ups go
+# in git, a campaign's data does not. tier-trace.csv is live D4c tier telemetry,
+# appended by cron every 60s since 2026-07-16 (~42k rows / 1.8 MB and growing).
+# It is regenerable from tier-poll.sh, which SHOULD be committed.
+*.csv
