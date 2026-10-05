@@ -24,6 +24,10 @@ from urllib.parse import parse_qs, urlparse
 CLIENT_PORT_START = 22135
 CLIENT_PORT_RANGE = 15
 SWEEP_PORT        = 22134   # fixed sweep socket port — same as servers.php CLIENT_PORT
+# TEST 2026-08-22: directories listed here get their OWN sweep socket on the given port
+# instead of sharing SWEEP_PORT, so their sweeps run concurrently with the rest.
+# Empty dict == original behaviour (all sweeps serialized on 22134).
+SWEEP_PORT_OVERRIDES = {'choral.jamulus.io:22724': 22150}
 TIMEOUT_SEC       = 0.5
 MAX_ATTEMPTS      = 3
 
@@ -247,6 +251,33 @@ _sweep_sock.bind(('0.0.0.0', SWEEP_PORT))
 _sweep_sock.settimeout(TIMEOUT_SEC)
 _sweep_lock = threading.Lock()
 
+# TEST 2026-08-22: overridden directories get a dedicated socket + lock, created lazily.
+_sweep_extra      = {}                 # 'host:port' -> (socket, lock)
+_sweep_extra_lock = threading.Lock()
+
+def _sweep_channel(host: str, port: int):
+    """Return (socket, lock) for this directory's sweep.
+
+    Default is the shared 22134 socket serialized by _sweep_lock. A directory named in
+    SWEEP_PORT_OVERRIDES gets its own bound socket and its own lock, so it sweeps
+    concurrently with the others. The port must be STABLE: the directory advertises our
+    source port to every registered server as the hole-punch return address.
+    """
+    key = f'{host}:{port}'
+    p = SWEEP_PORT_OVERRIDES.get(key)
+    if p is None:
+        return _sweep_sock, _sweep_lock
+    with _sweep_extra_lock:
+        ch = _sweep_extra.get(key)
+        if ch is None:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.bind(('0.0.0.0', p))
+            s.settimeout(TIMEOUT_SEC)
+            ch = (s, threading.Lock())
+            _sweep_extra[key] = ch
+            print(f'[sweep] {key} using DEDICATED sweep port {p}', file=sys.stderr, flush=True)
+        return ch
+
 # ── Packet parsing helpers ────────────────────────────────────────────────────
 
 def _parse_server_list(payload: bytes, dir_ip: str, dir_port: int) -> list:
@@ -302,8 +333,9 @@ def sweep_directory(host: str, port: int):
     except socket.gaierror as e:
         return None, None, str(e)
 
-    with _sweep_lock:
-        sock = _sweep_sock
+    _sweep_s, _sweep_l = _sweep_channel(host, port)
+    with _sweep_l:
+        sock = _sweep_s
 
         # Phase 1: get server list from directory.
         # Buffer any 1002 pings that arrive while waiting for 1006 — the directory
