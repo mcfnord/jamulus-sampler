@@ -27,7 +27,10 @@ SWEEP_PORT        = 22134   # fixed sweep socket port — same as servers.php CL
 # TEST 2026-08-22: directories listed here get their OWN sweep socket on the given port
 # instead of sharing SWEEP_PORT, so their sweeps run concurrently with the rest.
 # Empty dict == original behaviour (all sweeps serialized on 22134).
-SWEEP_PORT_OVERRIDES = {'choral.jamulus.io:22724': 22150}
+SWEEP_PORT_OVERRIDES = {}   # per-directory sweep port. Deliberately EMPTY: giving choral its
+                            # own socket on 22150 changed nothing (ratio 1.00x, 2026-08-22,
+                            # re-confirmed over 3.6 more days). Sweep serialization is NOT the
+                            # bottleneck — the dead-server probe backlog is. Do not re-run.
 TIMEOUT_SEC       = 0.5
 MAX_ATTEMPTS      = 3
 
@@ -47,7 +50,15 @@ _TIER_RATES = {
 }
 GLOBAL_NORMAL_PERCENTILE = 90  # active_pool above this percentile of yesterday → normal idle cap
 GLOBAL_BUSY_PERCENTILE   = 98  # active_pool above this percentile of yesterday → busy idle cap
+WATCHDOG_QUEUE_RATIO = 0.5  # warn when >this share of SERVER_STATE is queued but not started.
+WATCHDOG_WARN_EVERY  = 300.0  # s — throttle; the scheduler loop runs ~1x/s.
+                            # The old gate was `_n_inf == _n_tot`, which never fired: silent
+                            # at 96% queued (3,689/3,851, 2026-08-22) and 0 hits in 3.6 days.
 DIRECTORY_SWEEP =  90.0   # s — re-query directory; NAT TTL measured ≥120s
+REAP_AFTER      = 1800.0  # s — retire a server unlisted by EVERY directory this long.
+                          # Membership-based on purpose: punch-required fleet servers
+                          # fail every pool probe by design yet stay listed, so a
+                          # reachability-based reaper would retire our own fleet.
 
 # Directories pre-probed on startup (the 7 queried by gather-server-data.py)
 DIRECTORIES = [
@@ -588,6 +599,8 @@ _heap_lock        = threading.Lock()
 
 # Probe throughput counters (server probes only, not directory sweeps)
 _probes_total    = 0
+_watchdog_last   = 0.0  # last [watchdog] warn (see WATCHDOG_WARN_EVERY)
+_reaped_total    = 0   # servers retired by the membership reaper (see REAP_AFTER)
 _probes_t0       = time.time()   # set at startup
 _tasks_submitted = 0   # total srv tasks dispatched to executor (including early-exit ones)
 
@@ -707,13 +720,14 @@ def _do_dir_task(dir_key: str):
                     '_cooldown': 0,
                     'os': '', 'version': '', 'versionsort': '',
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
-                    '_last_sweep_success': 0.0,
+                    '_last_sweep_success': 0.0, '_last_listed': now,
                     '_probe_attempts': 0, '_probe_successes': 0,
                     '_probe_inflight': False,
                 }
                 new_keys.append(key)
             else:
                 ss = SERVER_STATE[key]
+                ss['_last_listed'] = now
                 ss['name']       = s['name']
                 ss['countryid']  = s['countryid']
                 ss['country']    = s['country']
@@ -783,10 +797,25 @@ def _do_srv_task(srv_key: str):
     ip, _, port_str = ip_port.rpartition(':')
     port = int(port_str)
 
+    global _reaped_total
     with _STATE_LOCK:
         if ip_port not in SERVER_STATE:
             return
         state = SERVER_STATE[ip_port]
+        # Reap on membership, not reachability (see REAP_AFTER). Guard (b): only when
+        # every directory has swept since the server was last listed — a down directory
+        # therefore blocks all reaping rather than causing any.
+        last_listed = state.get('_last_listed', 0.0)
+        if last_listed > 0.0 and time.time() - last_listed > REAP_AFTER:
+            min_sweep = min((ds['last_sweep'] for ds in DIRECTORY_STATE.values()),
+                            default=0.0)
+            if last_listed < min_sweep - DIRECTORY_SWEEP:
+                del SERVER_STATE[ip_port]
+                _reaped_total += 1
+                print(f'[reap] {ip_port} name={state["name"]!r} '
+                      f'unlisted={time.time() - last_listed:.0f}s — retired',
+                      file=sys.stderr, flush=True)
+                return  # token dies; any future listing recreates the server
         if time.time() < state['_min_probe']:
             state['_probe_inflight'] = False
             return  # stale heap entry — a probe already ran recently
@@ -906,8 +935,16 @@ def _scheduler_loop():
         with _STATE_LOCK:
             _n_inf = sum(1 for s in SERVER_STATE.values() if s.get('_probe_inflight'))
             _n_tot = len(SERVER_STATE)
-        if _n_inf == _n_tot > 100:
-            print(f'[watchdog] ALL {_n_inf}/{_n_tot} servers stuck inflight', file=sys.stderr, flush=True)
+        if _n_tot > 100 and _n_inf > _n_tot * WATCHDOG_QUEUE_RATIO:
+            # Throttled: this loop runs ~1x/s, and an unthrottled warn would add ~86k
+            # lines/day to a host whose disk is the tight resource (75% full, journald
+            # already at its default cap).
+            global _watchdog_last
+            if time.time() - _watchdog_last > WATCHDOG_WARN_EVERY:
+                _watchdog_last = time.time()
+                print(f'[watchdog] queue depth {_n_inf}/{_n_tot} '
+                      f'({100.0*_n_inf/_n_tot:.0f}%) — probe backlog starving sweeps',
+                      file=sys.stderr, flush=True)
         sleep = max(0.05, min(_heap_next_time() - time.time(), 1.0))
         time.sleep(sleep)
 
@@ -1014,6 +1051,7 @@ class Handler(BaseHTTPRequestHandler):
                     'total':        n_total,
                     'reachable':    n_reachable,
                     'unreachable':  n_total - n_reachable,
+                    'reaped_total': _reaped_total,
                     'with_clients':    n_clients,
                     'total_clients':   total_clients,
                     'active_tier':     n_active,
