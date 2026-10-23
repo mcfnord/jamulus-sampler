@@ -88,8 +88,9 @@ def type_map(rows):
     return t
 
 
-def check_order(label, keys, order, allowed_extra=(), unordered=frozenset()):
-    """Keys must appear in `order`, except members of `unordered`, whose relative position is free."""
+def check_order(label, keys, order, allowed_extra=(), unordered=frozenset(), index_last=True):
+    """Keys must appear in `order`, except members of `unordered`, whose relative position is free.
+    In directory mode servers.php appends `index` last; in server=/query= mode it is set first."""
     base = [k for k in keys if k in order and k not in unordered]
     want = [k for k in order if k in keys and k not in unordered]
     if base != want:
@@ -97,7 +98,7 @@ def check_order(label, keys, order, allowed_extra=(), unordered=frozenset()):
     stray = [k for k in keys if k not in order and k not in allowed_extra]
     if stray:
         fail(f'{label}: keys not in servers.php grammar: {stray}')
-    if 'index' in keys and keys[-1] != 'index':
+    if index_last and 'index' in keys and keys[-1] != 'index':
         fail(f'{label}: index is not the last key (servers.php appends it last)')
 
 
@@ -148,10 +149,16 @@ def check_directory(ctx, d, s_rows, e_rows):
         fail(f'{label} ... {bad_type} type mismatches in all')
     if not (bad_type or bad_numip or bad_noreply or bad_corder or bad_sorder):
         ok(f'{label} every row matches the servers.php grammar')
-    # feature coverage: not a grammar failure, but the reason Explorer-style callers care
+    # Feature/welcome/port2 COVERAGE — a WARN, never a FAIL. These fields are collected
+    # per-server over successive probes and (for port2) only when a NAT-behind server happens
+    # to answer from an alternate port, so the count at any instant is intermittent: Explorer's
+    # own lon1 vs lon2 differ here too (the --control arm proves it). Structural correctness of
+    # whatever IS carried is enforced above (key order, types); this only tracks how many rows
+    # carry the optional field, and reports a shortfall for a human to watch, not a failure.
     for k in sorted(SERVER_OPTIONAL):
         s_n = sum(k in r for r in s_rows); e_n = sum(k in r for r in e_rows)
-        (ok if s_n or not e_n else fail)(f'{label} rows carrying {k}: sampler {s_n}, explorer {e_n}')
+        msg = f'{label} rows carrying {k}: sampler {s_n}, explorer {e_n}'
+        (ok if s_n >= e_n else warn)(msg)
 
 
 def check_modes(args, a_server):
@@ -165,9 +172,17 @@ def check_modes(args, a_server):
     st, _, body = get(sampler_url(S, 'directory=nosuch.invalid:22124'))
     want = b'{"error":"Directory or server not found"}'
     (ok if st == 200 and body.strip() == want else fail)(f'[unknown dir] sampler {st} {body[:60]!r}; servers.php 200 {want!r}')
-    # malformed port
-    st, _, body = get(sampler_url(S, 'directory=anygenre1.jamulus.io:abc'))
-    (ok if st == 200 and body.strip() == want else fail)(f'[bad port] sampler {st} {body[:60]!r}; servers.php 200 {want!r}')
+    # malformed (bad port, empty value): servers.php parse_host() fails → "Invalid …" (measured 2026-10-23)
+    want = b'{"error":"Invalid directory or server specified"}'
+    for q in ('directory=anygenre1.jamulus.io:abc', 'directory=', 'central='):
+        st, _, body = get(sampler_url(S, q))
+        (ok if st == 200 and body.strip() == want else fail)(f'[malformed ?{q}] sampler {st} {body[:60]!r}; servers.php 200 {want!r}')
+    # IPv6 literal: servers.php resolves it, hears nothing, answers []
+    st, _, body = get(sampler_url(S, 'directory=%5B2001:db8::1%5D:22124'))
+    (ok if st == 200 and body.strip() == b'[]' else fail)(f'[ipv6 literal] sampler {st} {body[:60]!r}; servers.php 200 []')
+    # single server that never answers → []
+    st, _, body = get(sampler_url(S, 'server=127.0.0.1:1'))
+    (ok if st == 200 and body.strip() == b'[]' else fail)(f'[server= no answer] sampler {st} {body[:60]!r}; servers.php 200 []')
     # known directory must ALWAYS be a list (the jamfan26 pass-through rule)
     for d in DIRECTORIES:
         st, _, body = get(sampler_url(S, f'directory={d}'))
@@ -198,7 +213,8 @@ def check_modes(args, a_server):
         fail(f'[server=] sampler {st} {body[:80]!r}; servers.php: 200, one-element list')
     else:
         r = rows[0]
-        check_order('[server=] row', list(r), SINGLE_ORDER + sorted(SERVER_MIDDLE), unordered=SERVER_MIDDLE)
+        check_order('[server=] row', list(r), SINGLE_ORDER + sorted(SERVER_MIDDLE), unordered=SERVER_MIDDLE,
+                    index_last=False)
         (ok if r.get('name') == 'Parity Check' else fail)(f'[server=] name={r.get("name")!r}; servers.php echoes &name= ("Parity Check")')
         (ok if isinstance(r.get('numip'), str) and NUMIP_RE.match(r['numip']) else fail)(f'[server=] numip={r.get("numip")!r}')
         if not FAILS or not any('[server=]' in f for f in FAILS):
