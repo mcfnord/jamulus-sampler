@@ -452,7 +452,8 @@ def sweep_directory(host: str, port: int):
         # ping back to the server so it sees bidirectional traffic; on the SECOND response
         # we send 1014. This is required for servers behind strict NAT — our outbound 1014
         # would be blocked if we skip the return ping.
-        server_keys = {f"{s['ip']}:{s['port']}" for s in server_list}
+        server_order = [f"{s['ip']}:{s['port']}" for s in server_list]   # listing order matters for port2
+        server_keys = set(server_order)
         probe_results = {}   # ip:port → {ping, nclients, clients, [os, version, versionsort, features, welcome, port2]}
         first_ping_sent = set()   # keys where we sent a return ping (awaiting 2nd response)
         clients_requested = set()
@@ -468,19 +469,23 @@ def sweep_directory(host: str, port: int):
 
         def _key_for(fip, fport):
             """Listed key for a reply, or None. servers.php port2: a reply from a listed IP on an
-            unlisted port is taken for the one still-silent server at that IP."""
+            unlisted port is taken for the FIRST listed room at that IP that has no port2 yet
+            (servers.php's CLM_EMPTY_MESSAGE case walks $serverbyip[$fromip] in order and takes the
+            first without one). Three rooms on one NAT (the Chamber rooms, 142.114.242.94) only
+            resolve this way — requiring a unique candidate left them all unattributed (measured
+            2026-10-23: classical port2 0 vs Explorer 4)."""
             key = f"{fip}:{fport}"
             if key in server_keys:
                 return key
             if key in aliases:
                 return aliases[key]
-            cands = [k for k in server_keys
-                     if k.rsplit(':', 1)[0] == fip and k not in probe_results]
-            if len(cands) != 1:
-                return None
-            aliases[key] = cands[0]
-            port2[cands[0]] = fport
-            return cands[0]
+            taken = set(aliases.values())
+            for k in server_order:
+                if k.rsplit(':', 1)[0] == fip and k not in taken and k not in probe_results:
+                    aliases[key] = k
+                    port2[k] = fport
+                    return k
+            return None
 
         def _apply_info(key, mid, payload):
             """Version / features / welcome replies — the same fields the pool probe fills."""
