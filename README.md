@@ -35,13 +35,30 @@ from memory without waiting on the network.
 
 ## HTTP API (port 5001)
 
+The sampler is a drop-in for softins' [`servers.php`](https://github.com/softins/jamulus-php): point a
+`servers.php` consumer at `/servers.php` here and it gets the same JSON — same keys, key order, value
+types and error bodies — with two additions per client, `first_seen` and `last_absent`. `tools/parity.py`
+is the acceptance test (it compares every directory against `explorer.jamulus.io` and passes with 0
+structural differences; its `--control` arm compares Explorer's two backends with each other to show
+what timing noise alone produces).
+
 | Request | Returns |
 |---|---|
-| `GET /servers?central=<host>:<port>` | One directory's servers, in the same JSON shape as `servers.php`, plus `first_seen` / `last_absent` per client. `?directory=` is accepted as an alias. A bare host means port 22124. |
+| `GET /servers.php?directory=<host>:<port>` (alias `/servers`, `?central=`) | One directory's servers in `servers.php`'s shape, plus `first_seen` / `last_absent` (Unix floats) per client. A bare host means port 22124. A directory not in `DIRECTORIES` is swept on demand and kept in the loop while requests keep coming (dropped after 30 min without one; at most `ADOPT_MAX` such directories). |
+| `GET /servers.php?server=<host>:<port>[&name=…]` | One server as `servers.php` returns it: a one-element list, or `[]` if it never answered. |
+| `GET /servers.php?query=<host>:<port>` | `servers.php`'s welcome-message query: a short audio connection that yields `client_id`, `rawaudio` and `welcome`. |
+| `&pretty` | Pretty-printed JSON, like `servers.php`. |
+| no parameter / malformed / unresolvable | `servers.php`'s bodies, HTTP 200: `{"error":"No directory or server specified"}`, `{"error":"Invalid directory or server specified"}`, `{"error":"Directory or server not found"}`. |
 | `GET /servers/all` | Every directory merged; each server is tagged with its `central`. |
-| `GET /stats` | Health: uptime, port-pool use, probe rate and queue depth, server counts (including `reaped_total`), per-directory sweep counts and age, unreachable servers, and the activity tiers. |
-| `GET /debug/stuck` | Servers with a probe queued or in flight. |
-| `POST /ping-density` | Body `{"active_pool": N, "ts": <unix>}`. Sets the global activity level used to tighten idle probing. |
+| `GET /stats` *(admin)* | Health: uptime, port-pool use, probe rate and queue depth, server counts (including `reaped_total`), per-directory sweep counts and age, unreachable servers, and the activity tiers. |
+| `GET /debug/stuck` *(admin)* | Servers with a probe queued or in flight. |
+| `POST /ping-density` *(admin)* | Body `{"active_pool": N, "ts": <unix>}`. Sets the global activity level used to tighten idle probing. |
+
+*(admin)* routes answer only to `127.0.0.1` and the addresses in `SAMPLER_ADMIN_IPS`; everyone else
+gets 403. Everything else is public and read-only, served from memory by a threaded server.
+
+Environment knobs: `SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket, with the 15
+probe ports above it), `SAMPLER_ADMIN_IPS` (comma-separated).
 
 Example:
 
@@ -72,8 +89,14 @@ It sends UDP from fixed local ports:
 | 22134 (`SWEEP_PORT`) | Directory sweeps. This port must stay fixed: the directory gives it to every server as the address to ping back. |
 | 22135–22149 (`CLIENT_PORT_START`, `CLIENT_PORT_RANGE`) | One port per probe in flight, so at most 15 probes run at once. |
 
-Every exchange is started by the sampler, so a stateful firewall that allows replies
-(`RELATED,ESTABLISHED`) is enough; no inbound UDP rule is needed.
+**The firewall must allow inbound UDP to the whole range (22134–22149 by default) from any
+address and any port.** When the sampler asks a directory for its list, the directory tells every
+registered server to say hello to the sampler (`CLM_EMPTY_MESSAGE`) — from the server's *real*
+port, which is how a server behind NAT becomes reachable at all and how `port2` is learned. Those
+hellos are not replies to anything the sampler sent, so a stateful rule alone drops them.
+Measured 2026-10-23 on a host with only `RELATED,ESTABLISHED`: 1,014 dropped hellos in 24 hours and
+every NAT-only server permanently "unreachable"; with the rule, 25,000 hellos answered in the first
+hour and those servers reachable with real pings. (The same requirement is in jamulus-php's README.)
 
 A systemd unit along these lines keeps it running:
 
@@ -102,6 +125,7 @@ first few minutes after a restart.
 | File | Purpose |
 |---|---|
 | `sampler.py` | The daemon. |
+| `tools/parity.py` | servers.php parity test against `explorer.jamulus.io`: `python3 tools/parity.py [--sampler http://127.0.0.1:5001] [--control]`. |
 | `tier-poll.sh` | Optional observer: run from cron every minute, it appends one `/stats` row to `tier-trace.csv` so the activity tiers can be studied over time. It never touches the sampler. |
 
 ## Country and instrument tables
