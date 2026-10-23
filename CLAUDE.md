@@ -34,10 +34,14 @@ answers from that memory. The HTTP surface is a drop-in for softins' `servers.ph
    is ever reached and `port2` can never be observed. The firewall must allow inbound UDP to the
    whole range (sweep port, pool, on-demand ports) from anywhere — see the README.
 6. **Timestamps are stamped at send time.** A ping packet built once and reused makes the RTT read
-   as time since the sweep began. `_ping_pkt()` exists for this reason.
-7. **`_merge_probe_fields()` is the only place reply-driven fields enter a server's state** (os,
-   version, features, welcome, port2, the features-miss counter). An empty welcome is an answer;
-   `port2` is cleared when the server answers from its listed port.
+   as time since the sweep began. `ping_packet()` exists for this reason; the payload-less requests
+   (`REQ_*_PKT`) are constants because they carry no stamp.
+7. **One template, one folder, one owner.** `no_reply()` is the shape of a server that has answered
+   nothing — every probe result, state entry and ad-hoc row starts from it, so a new reply field is
+   added in one place. `apply_reply_info()` folds a version/features/welcome reply for the sweep and
+   the pool probe alike. `_merge_probe_fields()` is the only place reply-driven fields enter a
+   server's state (os, version, features, welcome, port2, the features-miss counter). An empty
+   welcome is an answer; `port2` is cleared when the server answers from its listed port.
 
 ## Deployment knobs (environment)
 

@@ -1,8 +1,9 @@
 # jamulus-sampler
 
-A long-running daemon that keeps a live picture of every server on the seven built-in
-[Jamulus](https://jamulus.io) directories, who is connected to each one and when each person
-first appeared, and serves it over HTTP as JSON.
+A long-running daemon that keeps a live picture of every server on the seven public
+[Jamulus](https://jamulus.io) directories (and any other directory a request names), who is
+connected to each one and when each person first appeared, and serves it over HTTP as JSON in
+the shape of softins' `servers.php`.
 
 It replaces a `servers.php`-style page that queried the directory and every server on each
 web request. The sampler does the UDP work in the background, so an HTTP request is answered
@@ -11,10 +12,14 @@ from memory without waiting on the network.
 ## What it does
 
 - **Sweeps each directory** every 90 s (`DIRECTORY_SWEEP`). It asks for the server list
-  (`CLM_REQ_SERVER_LIST`) and handles the pings that servers send back through the
-  directory's hole-punch.
-- **Probes each listed server** for ping time, version/OS, and its connected-client list
-  (`CLM_PING_MS_WITHNUMCLIENTS`, `CLM_REQ_VERSION_AND_OS`, `CLM_REQ_CONN_CLIENTS_LIST`).
+  (`CLM_REQ_SERVER_LIST`); the directory then tells every listed server to say hello to the
+  sampler (`CLM_EMPTY_MESSAGE`), and the sampler answers each hello with a ping. That exchange is
+  the NAT hole-punch: it is the only way a server behind NAT becomes reachable, and the port the
+  hello came from is `servers.php`'s `port2`.
+- **Probes each listed server** for ping time, version/OS, features, welcome message and its
+  connected-client list (`CLM_PING_MS_WITHNUMCLIENTS`, then `CLM_REQ_VERSION_AND_OS`,
+  `CLM_REQ_SERVER_FEATURES`, `CLM_REQ_WELCOME_MESSAGE` and, when occupied,
+  `CLM_REQ_CONN_CLIENTS_LIST` — the same burst `servers.php` sends).
 - **Adapts the probe rate.** A server whose client list just changed is probed again in 4 s.
   After that the interval stretches by 1 s per unchanged probe, up to a cap: 6–10 s for a
   server with clients, 10–20 s for an empty one. The cap depends on two signals:
@@ -57,18 +62,20 @@ what timing noise alone produces).
 *(admin)* routes answer only to `127.0.0.1` and the addresses in `SAMPLER_ADMIN_IPS`; everyone else
 gets 403. Everything else is public and read-only, served from memory by a threaded server.
 
-Environment knobs: `SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket, with the 15
-probe ports above it), `SAMPLER_ADMIN_IPS` (comma-separated).
+Environment knobs: `SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket, with the
+15 probe ports and 4 on-demand ports above it), `SAMPLER_ADMIN_IPS` (comma-separated; with none
+set, the admin routes answer only to localhost).
 
 Example:
 
 ```sh
-curl -s 'http://127.0.0.1:5001/servers?central=anygenre1.jamulus.io:22124' | python3 -m json.tool | head
-curl -s http://127.0.0.1:5001/stats | python3 -m json.tool
+curl -s 'http://127.0.0.1:5001/servers.php?directory=anygenre1.jamulus.io:22124' | python3 -m json.tool | head
+curl -s 'http://127.0.0.1:5001/servers.php?server=rock.jamulus.io:22424&name=Rock'
+curl -s http://127.0.0.1:5001/stats | python3 -m json.tool      # from an admin address
 ```
 
-**There is no authentication**, and `POST /ping-density` changes how hard the sampler probes.
-The server binds `0.0.0.0:5001`, so restrict port 5001 to your own callers with a firewall.
+The public routes are read-only and answer from memory, so the HTTP port can face the internet.
+The server binds `0.0.0.0`; if you would rather not publish it, restrict the port with a firewall.
 
 ## Running it
 
@@ -79,8 +86,10 @@ python3 sampler.py
 ```
 
 On startup it schedules a sweep of each directory in `DIRECTORIES` and logs to stderr:
-`[dir]` for sweeps, `[reap]` for retired servers, and `[watchdog]` when more than half of
-all servers are waiting for a probe.
+`[dir]` for sweeps (including directories adopted on request), `[sweep]` for the exchanges
+within one (a hello that revealed a `port2`, client-list requests), `[reap]` for retired
+servers, `[watchdog]` when more than half of all servers are waiting for a probe, and `[http]`
+for a request that raised. Log lines carry counts and addresses, never player names.
 
 It sends UDP from a fixed block of local ports (`SAMPLER_UDP_BASE`, default 22134, and the 19
 ports above it):
@@ -113,6 +122,8 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/jamulus-sampler
+# Addresses allowed to read /stats and /debug/stuck and to POST /ping-density (localhost always is)
+Environment=SAMPLER_ADMIN_IPS=203.0.113.10
 ExecStart=/usr/bin/python3 /opt/jamulus-sampler/sampler.py
 Restart=always
 RestartSec=5

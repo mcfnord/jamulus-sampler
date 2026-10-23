@@ -10,9 +10,9 @@ servers.php's JSON shape — same keys, key order, value types, error bodies.
 The only additions are first_seen / last_absent (Unix floats) per client, and the
 sampler's own routes /servers/all and /stats. tools/parity.py is the acceptance test.
 
-Environment: SAMPLER_HTTP_PORT (5001), SAMPLER_UDP_BASE (22134: sweep socket, then 15 pool
-ports above it), SAMPLER_ADMIN_IPS (comma list allowed to POST /ping-density and read
-/stats, /debug/stuck; 127.0.0.1 is always allowed).
+Environment: SAMPLER_HTTP_PORT (5001), SAMPLER_UDP_BASE (22134: the sweep socket, then the 15
+probe-pool ports and 4 on-demand ports above it), SAMPLER_ADMIN_IPS (comma list allowed to
+POST /ping-density and read /stats, /debug/stuck; 127.0.0.1 is always allowed).
 """
 
 import heapq
