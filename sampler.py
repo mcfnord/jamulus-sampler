@@ -56,6 +56,7 @@ CLM_START                   = 1000
 CLM_PING_MS_WITHNUMCLIENTS  = 1002
 CLM_SERVER_LIST             = 1006
 CLM_REQ_SERVER_LIST         = 1007
+CLM_EMPTY_MESSAGE           = 1009   # the hole-punch: a server the directory introduced us to says hello
 CLM_DISCONNECTION           = 1010
 CLM_VERSION_AND_OS          = 1011
 CLM_REQ_VERSION_AND_OS      = 1012
@@ -457,6 +458,7 @@ def sweep_directory(host: str, port: int):
         clients_requested = set()
         aliases = {}   # "ip:replyport" → listed key, for a server answering from another port
         port2 = {}     # listed key → that reply port (servers.php's port2)
+        punched = set()  # keys whose 1009 hello we have answered with a ping
         ms = int(time.time() * 1000) % 86400000
         return_ping = build_packet(CLM_PING_MS_WITHNUMCLIENTS, struct.pack('<IB', ms, 0))
         # servers.php fires these three at every server right after its second ping reply
@@ -503,6 +505,18 @@ def sweep_directory(host: str, port: int):
             mid, _, payload = parsed
             key = _key_for(fip, fport)
             if key is None:
+                return
+            if mid == CLM_EMPTY_MESSAGE:
+                # The directory told this server to contact us; it sends CLM_EMPTY_MESSAGE (1009),
+                # not a ping, and from its REAL port — which is how servers.php learns port2. Answer
+                # with a ping so the normal two-ping exchange starts on that address. Before this
+                # branch the sampler ignored 1009 entirely ("1st ping from" = 0 on production for the
+                # whole log, measured 2026-10-23), so phase 2 never fired for anyone.
+                if key not in first_ping_sent and key not in punched:
+                    punched.add(key)
+                    sock.sendto(return_ping, (fip, fport))
+                    print(f'[sweep] {host}:{port} punch (1009) from {fip}:{fport} for {key}'
+                          f'{" port2" if key in port2 else ""} sent_ping', file=sys.stderr, flush=True)
                 return
             if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
                 timems_r, nclients = struct.unpack_from('<IB', payload)
