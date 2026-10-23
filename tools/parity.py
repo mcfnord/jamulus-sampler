@@ -18,15 +18,21 @@ import argparse
 import json
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+# The seven public directories. Kept as a copy of sampler.DIRECTORIES rather than imported:
+# importing sampler.py binds its UDP sockets at module load, and this test must run anywhere.
 DIRECTORIES = [
     'anygenre1.jamulus.io:22124', 'anygenre2.jamulus.io:22224', 'anygenre3.jamulus.io:22624',
     'rock.jamulus.io:22424', 'jazz.jamulus.io:22324', 'classical.jamulus.io:22524',
     'choral.jamulus.io:22724',
 ]
+# A DNS alias of the first directory: resolves, is not configured, and so exercises the on-demand
+# sweep-and-adopt path with a known answer (the same servers as anygenre1).
+UNCONFIGURED_ALIAS = 'anygenre1.jamulus.app:22124'
 
 # servers.php grammar, read off explorer.jamulus.io on 2026-10-23 (softins/jamulus-php b5462bf).
 # The first 14 keys are set from the directory's list entry and the ping reply, in this order.
@@ -70,6 +76,15 @@ def get(url, timeout=25):
         return e.code, dict(e.headers), e.read()
     except Exception as e:                                   # connection reset, timeout, ...
         return 0, {}, repr(e).encode()
+
+
+def get_json(url, timeout=25):
+    """get() plus a tolerant parse: (status, headers, body, parsed-or-None)."""
+    st, h, body = get(url, timeout)
+    try:
+        return st, h, body, json.loads(body)
+    except Exception:
+        return st, h, body, None
 
 
 def sampler_url(base, query):
@@ -161,8 +176,9 @@ def check_directory(ctx, d, s_rows, e_rows):
         (ok if s_n >= e_n else warn)(msg)
 
 
-def check_modes(args, a_server):
-    """Behaviour for the non-directory requests, compared against servers.php's live answers."""
+def check_modes(args, a_server, pass1):
+    """Behaviour for the non-directory requests, compared against servers.php's live answers.
+    pass1: {directory: (status, headers, parsed rows)} from the directory pass, reused here."""
     S, E = args.sampler, args.explorer
     # no parameter
     st, _, body = get(sampler_url(S, ''))
@@ -183,53 +199,59 @@ def check_modes(args, a_server):
     # single server that never answers → []
     st, _, body = get(sampler_url(S, 'server=127.0.0.1:1'))
     (ok if st == 200 and body.strip() == b'[]' else fail)(f'[server= no answer] sampler {st} {body[:60]!r}; servers.php 200 []')
-    # known directory must ALWAYS be a list (the jamfan26 pass-through rule)
-    for d in DIRECTORIES:
-        st, _, body = get(sampler_url(S, f'directory={d}'))
-        try:
-            is_list = isinstance(json.loads(body), list)
-        except Exception:
-            is_list = False
-        if st != 200 or not is_list:
-            fail(f'[known dir {d}] sampler {st}, body not a list: {body[:60]!r}')
-    ok('[known dirs] all 7 answered 200 with a list') if not any('[known dir' in f for f in FAILS) else None
+    # a known directory must ALWAYS be a list (downstream consumers iterate it without checking)
+    for d, (st, _, rows) in pass1.items():
+        if st != 200 or not isinstance(rows, list):
+            fail(f'[known dir {d}] sampler {st}, body not a list')
+    if not any('[known dir' in f for f in FAILS):
+        ok('[known dirs] all 7 answered 200 with a list')
+    # on-demand sweep of an unconfigured directory (the alias), then a second request served from state
+    if not args.control:
+        t0 = time.time(); st, _, body, rows = get_json(sampler_url(S, f'directory={UNCONFIGURED_ALIAS}'), timeout=90); t1 = time.time() - t0
+        if st != 200 or not isinstance(rows, list) or not rows:
+            fail(f'[on-demand dir] sampler {st} {body[:60]!r} after {t1:.1f}s; servers.php: a list for any directory that answers')
+        else:
+            t0 = time.time(); st2, _, body2 = get(sampler_url(S, f'directory={UNCONFIGURED_ALIAS}')); t2 = time.time() - t0
+            (ok if st2 == 200 and t2 < t1 else warn)(f'[on-demand dir] first request {len(rows)} rows in {t1:.1f}s, second in {t2:.2f}s (adopted: served from state)')
     # pretty
     st, _, body = get(sampler_url(S, f'directory={DIRECTORIES[0]}&pretty'))
     newlines = body.count(b'\n')
     (ok if st == 200 and newlines > 2 else fail)(f'[pretty] sampler {st}, {newlines} newlines (servers.php pretty-prints)')
-    # content-type
-    _, h, _ = get(sampler_url(S, f'directory={DIRECTORIES[0]}'))
+    # content-type, from the directory pass
+    h = next(iter(pass1.values()))[1] if pass1 else {}
     ct = {k.lower(): v for k, v in h.items()}.get('content-type', '')
     (ok if ct.startswith('application/json') else fail)(f'[content-type] sampler {ct!r}; servers.php application/json')
     if not a_server:
         warn('[server=/query=] no answering server found in the directory data, modes not checked'); return
     # single server
-    st, _, body = get(sampler_url(S, f'server={a_server}&name=Parity+Check'))
-    try:
-        rows = json.loads(body)
-    except Exception:
-        rows = None
+    st, _, body, rows = get_json(sampler_url(S, f'server={a_server}&name=Parity+Check'))
     if st != 200 or not isinstance(rows, list) or len(rows) != 1:
         fail(f'[server=] sampler {st} {body[:80]!r}; servers.php: 200, one-element list')
     else:
         r = rows[0]
-        check_order('[server=] row', list(r), SINGLE_ORDER + sorted(SERVER_MIDDLE), unordered=SERVER_MIDDLE,
-                    index_last=False)
+        check_order('[server=] row', list(r), SINGLE_ORDER + sorted(SERVER_MIDDLE - {'nclients'}),
+                    unordered=SERVER_MIDDLE, index_last=False)
         (ok if r.get('name') == 'Parity Check' else fail)(f'[server=] name={r.get("name")!r}; servers.php echoes &name= ("Parity Check")')
         (ok if isinstance(r.get('numip'), str) and NUMIP_RE.match(r['numip']) else fail)(f'[server=] numip={r.get("numip")!r}')
-        if not FAILS or not any('[server=]' in f for f in FAILS):
+        if not any('[server=]' in f for f in FAILS):
             ok(f'[server=] one-element list, servers.php shape')
     # welcome query
-    st, _, body = get(sampler_url(S, f'query={a_server}'), timeout=40)
-    try:
-        rows = json.loads(body)
-    except Exception:
-        rows = None
+    st, _, body, rows = get_json(sampler_url(S, f'query={a_server}'), timeout=40)
     if st != 200 or not isinstance(rows, list) or len(rows) != 1:
         fail(f'[query=] sampler {st} {body[:80]!r}; servers.php: 200, one-element list')
     else:
-        missing = QUERY_KEYS - set(rows[0]) - {'rawaudio', 'welcome'}   # rawaudio/welcome depend on the server
-        (ok if not missing else fail)(f'[query=] keys missing vs servers.php: {sorted(missing) or "none"}')
+        # client_id / rawaudio / welcome appear only when the server sends them (old servers send no
+        # CLIENT_ID at all), so the ground truth is servers.php's own answer for the same server.
+        st_e, _, _, e_rows = get_json(f'{E}?query={a_server}', timeout=40)
+        e_keys = set(e_rows[0]) if st_e == 200 and isinstance(e_rows, list) and e_rows else None
+        base_missing = (QUERY_KEYS - {'client_id', 'rawaudio', 'welcome'}) - set(rows[0])
+        if base_missing:
+            fail(f'[query=] keys missing vs servers.php: {sorted(base_missing)}')
+        elif e_keys is None:
+            warn(f'[query=] shape ok; servers.php did not answer for {a_server}, optional keys not compared')
+        else:
+            diff = set(rows[0]) ^ e_keys
+            (ok if not diff else warn)(f'[query=] keys {"match" if not diff else "differ: " + str(sorted(diff))} servers.php for {a_server} (optional keys depend on timing)')
 
 
 def main():
@@ -244,19 +266,19 @@ def main():
     ctx = {'e_types': {}, 'e_ctypes': {}}
     a_server = None
     pairs = []
+    pass1 = {}      # directory → (sampler status, headers, rows) for check_modes
     # Pass 1: fetch everything and learn servers.php's value types over ALL directories, so a
     # type that only one directory happens to show (a null city, say) is not a false mismatch.
     for d in DIRECTORIES:
-        st_e, _, body_e = get(f'{args.explorer}?directory={d}')
-        st_s, _, body_s = get(sampler_url(args.sampler, f'directory={d}'))
+        st_e, _, body_e, e_rows = get_json(f'{args.explorer}?directory={d}')
+        st_s, h_s, body_s, s_rows = get_json(sampler_url(args.sampler, f'directory={d}'))
+        pass1[d] = (st_s, h_s, s_rows)
         if st_e != 200:
             warn(f'[{d}] explorer returned {st_e}; skipped'); continue
         if st_s != 200:
             fail(f'[{d}] sampler returned {st_s}: {body_s[:80]!r}'); continue
-        try:
-            e_rows, s_rows = json.loads(body_e), json.loads(body_s)
-        except Exception as e:
-            fail(f'[{d}] JSON parse: {e}'); continue
+        if e_rows is None or s_rows is None:
+            fail(f'[{d}] JSON parse failed (explorer ok={e_rows is not None}, sampler ok={s_rows is not None})'); continue
         if isinstance(e_rows, dict):
             warn(f'[{d}] explorer answered an error object {e_rows}; skipped'); continue
         for k, v in type_map(e_rows).items():
@@ -272,7 +294,7 @@ def main():
     for d, s_rows, e_rows in pairs:
         check_directory(ctx, d, s_rows, e_rows)
     if not args.no_modes:
-        check_modes(args, a_server)
+        check_modes(args, a_server, pass1)
     print(f'\n{len(FAILS)} FAIL, {len(WARNS)} WARN')
     sys.exit(1 if FAILS else 0)
 

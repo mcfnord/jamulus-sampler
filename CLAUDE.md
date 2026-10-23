@@ -1,92 +1,66 @@
 # CLAUDE.md — jamulus-sampler
 
-Persistent Python daemon on `137.184.43.255` replacing `servers.php`. Probes Jamulus servers in the background; HTTP handler returns instantly from in-memory state.
+Guidance for an AI agent (or a new maintainer) working in this repository. The README is the
+user-facing description; this file holds the invariants that are easy to break and the way the
+code is meant to be changed.
 
-## Service
+## What it is
 
-```
-systemctl status jamulus-sampler.service   # check health
-systemctl restart jamulus-sampler.service  # restart
-journalctl -u jamulus-sampler.service -n 100  # recent logs
-```
+One Python 3 file, standard library only. A background scheduler probes every server on the
+configured Jamulus directories over UDP and keeps the result in memory; a threaded HTTP server
+answers from that memory. The HTTP surface is a drop-in for softins' `servers.php`
+(same JSON, same request modes, same error bodies) plus `first_seen` / `last_absent` per client.
 
-Runs on port **5001**. Nothing listens on 80/443 here (apache2 and php-fpm are installed but inactive); `servers.php` is no longer a rollback path on this host.
+## Invariants — check these before and after any change
 
-## Endpoints
+1. **servers.php parity.** `tools/parity.py` must exit 0 against `explorer.jamulus.io` (0 structural
+   FAIL; coverage lines are WARN). Its `--control` arm compares Explorer's two backends with each
+   other and must also exit 0 — any check the control arm fails is a wrong check, not a wrong sampler.
+   Key order, value types, `numip` as `"4:<hex>"`, the no-reply shape (`ping: -1` and NO
+   `nclients`/`clients`), the three error bodies, and `?server=` dropping a server that never
+   answered are all servers.php behaviour read off its source; change them only with servers.php.
+2. **A configured directory always answers a JSON list** — possibly `[]`, never an error object.
+   Downstream consumers iterate the result without checking its type.
+3. **The GUID lookup tables are protocol.** `COUNTRIES` and `INSTRUMENTS` match servers.php at every
+   index. Anything that derives an identity from name + country + instrument depends on them; after
+   any edit compare entry by entry, not by length — one inserted row shifts everything after it.
+4. **Nothing in the UDP path blocks on the HTTP path and nothing in the HTTP path waits for the
+   probe pool.** The 15 pool ports run saturated on a busy host; `?server=` and `?query=` use their
+   own four on-demand ports (`ONDEMAND_PORTS`) and a request-driven directory sweep is rate-limited
+   (`ONDEMAND_COOLDOWN`) and serialised (`_adopt_lock`) so a client cannot starve the scheduler or
+   turn the daemon into a UDP scanner.
+5. **The hole-punch is answered.** A directory introduction arrives as `CLM_EMPTY_MESSAGE` (1009)
+   from the server's real port; the sweep answers it with a ping. Without that, no server behind NAT
+   is ever reached and `port2` can never be observed. The firewall must allow inbound UDP to the
+   whole range (sweep port, pool, on-demand ports) from anywhere — see the README.
+6. **Timestamps are stamped at send time.** A ping packet built once and reused makes the RTT read
+   as time since the sweep began. `_ping_pkt()` exists for this reason.
+7. **`_merge_probe_fields()` is the only place reply-driven fields enter a server's state** (os,
+   version, features, welcome, port2, the features-miss counter). An empty welcome is an answer;
+   `port2` is cleared when the server answers from its listed port.
 
-| Endpoint | Description |
-|---|---|
-| `GET /servers?central=<host>:<port>` | Server list for one directory (also `?directory=`). Same JSON as servers.php + `first_seen`/`last_absent` per client. |
-| `GET /servers/all` | Merged list from all 7 directories; each server tagged with `central` field. |
-| `GET /stats` | Probe health: `probes.per_second`, `directories[]` (with `sweep_count`, `last_sweep_ago_s`), `unreachable_servers[]` (with `probe_attempts`, `probe_successes`), `activity` tier histogram, `active_pool`. |
-| `POST /ping-density` | jamfan26 pushes `{"active_pool":N,"ts":unix}` — count of unique ALLOWED client IPs seen in the last 180s. Tightens the global idle-probe cap (`_global_idle_cap_locked`). |
-| `GET /debug/stuck` | Servers currently marked `_probe_inflight` — use when throughput drops or the watchdog logs `ALL n/n stuck`. |
+## Deployment knobs (environment)
 
-## Key Constants (`sampler.py`)
+`SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket; pool and on-demand ports
+follow), `SAMPLER_ADMIN_IPS` (comma list allowed to read `/stats`, `/debug/stuck` and POST
+`/ping-density`; `127.0.0.1` always). Two instances on one host need different bases.
 
-```python
-# Probe intervals are TIERED, not flat. Old PROBE_ACTIVE/STABLE/IDLE/PROBE_DORMANT
-# constants were removed — do not reintroduce them.
-_TIER_RATES = {              # (probe_active, probe_stable, probe_idle) seconds
-    "quiet":  (4.0, 10.0, 20.0),
-    "normal": (4.0,  8.0, 15.0),
-    "busy":   (4.0,  6.0, 10.0),
-}
-DIRECTORY_SWEEP   =  90.0   # s — re-query directory (NAT TTL ≥120s measured)
-CLIENT_PORT_RANGE =  15     # 15 pool ports 22135–22149; ONE probe each
-SWEEP_PORT        =  22134  # separate socket, all directory sweeps share it
-GLOBAL_NORMAL_POOL = 8      # unique browser IPs (last 180s) → normal global idle tier
-GLOBAL_BUSY_POOL   = 15     # unique browser IPs (last 180s) → busy global idle tier
-```
+## How to work on it
 
-**How the tier is chosen (two independent signals):**
-- **Per-server** (`_server_tier`): rank the current clock hour against the server's own `hourly_events[24]` bins. `current ≤ p33` → quiet, `≥ p67` → busy, else normal. Defaults to normal until the server has logged ≥1 event. This is what makes probing follow each server's *own* daily rhythm.
-- **Global idle cap** (`_global_idle_cap_locked`): `_active_pool` (browser IPs, pushed via `POST /ping-density`) caps the idle interval for servers that aren't historically quiet. Historically-quiet servers (idle ≥ 20s) are exempt.
+- Run a second instance beside production for any change: another HTTP port and UDP base, then
+  `tools/parity.py --sampler http://127.0.0.1:<port>`; warm-up is two sweeps of every directory
+  (~3 minutes).
+- Read the production vantage, not just a developer box: NAT servers, the pool at 15/15 and the
+  hole-punch only show up on the host that the directories know.
+- Log lines are counts and addresses, never player names. Do not add a per-packet log line: the
+  sweep answers tens of thousands of hellos an hour.
+- State is in memory only; a restart forgets every server, so every client gets a fresh
+  `first_seen` at restart time.
 
-## CRITICAL: GUID Lookup Tables
+## Open design note
 
-GUIDs = `MD5(name + country_string + instrument_string)`. The `COUNTRIES` and `INSTRUMENTS` dicts in `sampler.py` were extracted **verbatim** from `/var/www/html/servers.php` on this server. Do not replace them with any other source.
-
-**`/tmp/probe1014.py`'s tables are wrong** — they diverge at instrument index 21 (PHP: `Cello`, probe1014.py: `Viola`) and at country index 4 (PHP: `American Samoa`, probe1014.py omits it). Using those tables produces GUIDs that don't match any historical data. If you need to verify, diff against the PHP arrays at `/var/www/html/servers.php` lines ~184–561.
-
-**Verified 2026-07-08:** `COUNTRIES` (262 entries, 0–261) and `INSTRUMENTS` (50 entries, 0–49) match `servers.php` **byte-for-byte at every index (0 divergences)**. **Rule — verify by element, not by length:** a mid-table insertion/shift keeps the count identical while corrupting every GUID from that index on (that is exactly how probe1014.py fails). After any table edit on either side, diff each `idx → value`, not just `len()`.
-
-## Architecture
-
-- Min-heap scheduler (`_heap`, protected by `_heap_lock`) drives all probes via a `ThreadPoolExecutor` (`max_workers=CLIENT_PORT_RANGE`).
-- Each server gets its own `SERVER_STATE` entry. Probe interval is set by `_do_srv_task` based on client activity.
-- Directory sweeps (`_do_dir_task`) run every `DIRECTORY_SWEEP` seconds per directory, repopulating `SERVER_STATE` with newly registered servers.
-- `probe_server()` always returns a dict (never `None` in normal operation). Success = `result.get('ping', -1) >= 0`.
-- Port pool (`_port_pool`, semaphore-guarded): 15 UDP ports for concurrent probes. `_ports_in_use` and `_ports_peak` track utilization; `/stats` exposes headroom.
-
-## Per-client timestamps
-
-Two fields per client in the JSON response:
-- `first_seen` — Unix float: when the sampler **first observed** this client on this server.
-- `last_absent` — Unix float: when the sampler **last probed and did not see** this client (lower bound on join time).
-
-Together they define a bounded join window `(last_absent, first_seen]` used by Layer 2 (Plan B) to narrow ping candidate lookup.
-
-## Validation (run from jamfan26 / 134.199.209.51)
-
-```bash
-# Quick sanity check
-curl -s 'http://137.184.43.255:5001/servers?central=anygenre1.jamulus.io:22124' | python3 -m json.tool | head -40
-curl -s 'http://137.184.43.255:5001/stats' | python3 -m json.tool
-
-# Long-running comparison vs servers.php
-python3 /root/compare-samplers.py --interval 5
-```
-
-## Deployment context
-
-- **M3 live (2026-06-10)**: active Layer 1 data source for `gather-server-data.py` on jamfan26. `BASE_URL` already points to `http://137.184.43.255:5001/servers?central=`.
-- Rollback if needed: change `BASE_URL` back to `http://137.184.43.255/servers.php?central=`, then `systemctl restart call-servers-php.service` on jamfan26. **⚠️ 2026-07-08: this is NOT instant — nginx + php-fpm on 137.184.43.255 are currently stopped, so `servers.php` returns nothing until you `systemctl start nginx php*-fpm` here first.**
-- GitHub: `https://github.com/mcfnord/jamulus-sampler`
-- **⚠️ jamfan26 IP is recorded inconsistently (tucked away for next time):** this file cites `134.199.209.51` (Validation section) *and* `24.199.107.192` (here). Both are live SSH hosts. 137.184.43.255 cannot SSH to either (trust is one-way: jamfan26 → here). Reconcile the canonical IP later; do not guess.
-
-## TODO / open decisions (inline, per project convention)
-
-- **Push or hold?** Local tree is 4 commits ahead of `origin/master` (D2/D3 ping-density). Repo is public — review before `git push`.
-- **Port pool saturates 15/15 in steady state** (not just cold start; observed 2026-07-08). **Widening it is code-only** — measured 2026-08-16, this host has *no* firewall rule for UDP 22134–22149 (`ufw status` allows only lo, 22/tcp, 80/tcp from two IPs, 5001/tcp; `iptables -S | grep -c '221[0-9][0-9]'` = 0). The pool rides `ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED` because the sampler always initiates, so ports above :22149 behave identically. *(This bullet previously claimed ufw had to be opened first; that was wrong and was quoted downstream as fact.)* Note the pool also sets `max_workers` for the shared `ThreadPoolExecutor`, so widening it is what buys headroom for concurrent directory sweeps — see `FLEET-SAMPLING-GAP.md` on central command for why sweeps currently run at 220 s against a 90 s `DIRECTORY_SWEEP`. Only pursue for join-window width if jamfan26 evidence shows they are too wide (see `JAMFAN26-AGENT-BRIEF.md`).
-- **POSTPONED tiny change toward IP↔GUID:** emit per-client `probe_interval` so Layer 2's documented `first_seen − probe_interval` fallback is computable. Gate: only if the correlator often sees clients lacking `last_absent`. Ask the jamfan26 agent to measure that first.
+Directories a request brings in ("adopted") are a special case grafted onto the scheduler
+(`adopted` flag, `ADOPT_MAX`, a drop check in `_do_dir_task`). A uniform model — every directory
+carries `last_request_time`, configured ones are pinned, and `_do_dir_task` is the only creator of
+scheduler tokens — would remove the flag and the special cases. Worth doing before adding a third
+kind of directory.

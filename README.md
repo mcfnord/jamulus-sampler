@@ -82,14 +82,19 @@ On startup it schedules a sweep of each directory in `DIRECTORIES` and logs to s
 `[dir]` for sweeps, `[reap]` for retired servers, and `[watchdog]` when more than half of
 all servers are waiting for a probe.
 
-It sends UDP from fixed local ports:
+It sends UDP from a fixed block of local ports (`SAMPLER_UDP_BASE`, default 22134, and the 19
+ports above it):
 
 | Port(s) | Use |
 |---|---|
-| 22134 (`SWEEP_PORT`) | Directory sweeps. This port must stay fixed: the directory gives it to every server as the address to ping back. |
-| 22135–22149 (`CLIENT_PORT_START`, `CLIENT_PORT_RANGE`) | One port per probe in flight, so at most 15 probes run at once. |
+| 22134 (`SWEEP_PORT`) | Directory sweeps. This port must stay fixed: the directory gives it to every server as the address to contact. |
+| 22135–22149 (`CLIENT_PORT_START`, `CLIENT_PORT_RANGE`) | One port per scheduled probe in flight, so at most 15 probes run at once. |
+| 22150–22153 (`ONDEMAND_PORTS`) | `?server=` and `?query=` requests, so they never queue behind the probe pool. |
 
-**The firewall must allow inbound UDP to the whole range (22134–22149 by default) from any
+A request for a directory that is not configured is swept on demand, like `servers.php` does on
+every request, at most once a minute per directory and never two at once.
+
+**The firewall must allow inbound UDP to the whole block (22134–22153 by default) from any
 address and any port.** When the sampler asks a directory for its list, the directory tells every
 registered server to say hello to the sampler (`CLM_EMPTY_MESSAGE`) — from the server's *real*
 port, which is how a server behind NAT becomes reachable at all and how `port2` is learned. Those
