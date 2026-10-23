@@ -3,12 +3,21 @@
 jamulus-sampler daemon — persistent background prober replacing servers.php.
 Background thread probes servers at adaptive rates; HTTP handler reads in-memory
 state instantly without blocking on UDP.
-Accepts GET /servers?central=<host>:<port> (also ?directory=).
-Response: same JSON as servers.php, plus first_seen (Unix float) per client.
+
+A drop-in for softins' servers.php: GET /servers (alias /servers.php) with
+?directory= (or ?central=), ?server=…&name=, ?query=, and &pretty answer in
+servers.php's JSON shape — same keys, key order, value types, error bodies.
+The only additions are first_seen / last_absent (Unix floats) per client, and the
+sampler's own routes /servers/all and /stats. tools/parity.py is the acceptance test.
+
+Environment: SAMPLER_HTTP_PORT (5001), SAMPLER_UDP_BASE (22134: sweep socket, then 15 pool
+ports above it), SAMPLER_ADMIN_IPS (comma list allowed to POST /ping-density and read
+/stats, /debug/stuck; 127.0.0.1 is always allowed).
 """
 
 import heapq
 import json
+import os
 import re
 import socket
 import struct
@@ -16,14 +25,23 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# ── Deployment knobs (env) ────────────────────────────────────────────────────
+
+HTTP_PORT = int(os.environ.get('SAMPLER_HTTP_PORT', '5001'))
+UDP_BASE  = int(os.environ.get('SAMPLER_UDP_BASE', '22134'))
+ADMIN_IPS = {'127.0.0.1'} | {
+    a.strip() for a in os.environ.get('SAMPLER_ADMIN_IPS', '24.199.107.192').split(',') if a.strip()
+}
+ADOPT_MAX = 8           # directories beyond DIRECTORIES that requests may make us sample
 
 # ── Protocol constants ────────────────────────────────────────────────────────
 
-CLIENT_PORT_START = 22135
+CLIENT_PORT_START = UDP_BASE + 1
 CLIENT_PORT_RANGE = 15
-SWEEP_PORT        = 22134   # fixed sweep socket port — same as servers.php CLIENT_PORT
+SWEEP_PORT        = UDP_BASE   # fixed sweep socket port — same as servers.php CLIENT_PORT
 # TEST 2026-08-22: directories listed here get their OWN sweep socket on the given port
 # instead of sharing SWEEP_PORT, so their sweeps run concurrently with the rest.
 # Empty dict == original behaviour (all sweeps serialized on 22134).
@@ -34,13 +52,34 @@ SWEEP_PORT_OVERRIDES = {}   # per-directory sweep port. Deliberately EMPTY: givi
 TIMEOUT_SEC       = 0.5
 MAX_ATTEMPTS      = 3
 
-CLM_PING_MS_WITHNUMCLIENTS = 1002
+CLM_START                   = 1000
+CLM_PING_MS_WITHNUMCLIENTS  = 1002
 CLM_SERVER_LIST             = 1006
 CLM_REQ_SERVER_LIST         = 1007
+CLM_DISCONNECTION           = 1010
 CLM_VERSION_AND_OS          = 1011
 CLM_REQ_VERSION_AND_OS      = 1012
 CLM_CONN_CLIENTS_LIST       = 1013
 CLM_REQ_CONN_CLIENTS_LIST   = 1014
+CLM_SERVER_FEATURES         = 1019
+CLM_REQ_SERVER_FEATURES     = 1020
+CLM_WELCOME_MESSAGE         = 1021
+CLM_REQ_WELCOME_MESSAGE     = 1022
+# connected-mode messages seen during ?query= (a short audio connection, as servers.php does)
+ACKN                        = 1
+CHAT_TEXT                   = 18
+CLIENT_ID                   = 32
+RAWAUDIO_SUPPORTED          = 36
+
+# CLM_SERVER_FEATURES bit names, verbatim from servers.php $features (bit index = position)
+FEATURE_BITS = ['fast_update', 'multithreading', 'recorder_enabled', 'is_recording', 'delay_pan',
+                'ipv6_available', 'raw_audio_available', 'discon_on_quit', 'has_welcome_message',
+                'is_logging', 'has_licence', 'has_gui', 'rpc_enabled']
+
+# servers.php error bodies, byte for byte
+ERR_NO_TARGET  = {'error': 'No directory or server specified'}
+ERR_INVALID    = {'error': 'Invalid directory or server specified'}
+ERR_NOT_FOUND  = {'error': 'Directory or server not found'}
 
 # (probe_active, probe_stable, probe_idle) per global activity tier
 _TIER_RATES = {
@@ -183,10 +222,17 @@ def compute_crc(data: bytes) -> int:
             if sr & 1: sr ^= poly
     return (~sr) & (bmask - 1)
 
-def build_packet(msg_id: int, payload: bytes = b'') -> bytes:
-    header = struct.pack('<HHBH', 0, msg_id, 0, len(payload))
+def build_packet(msg_id: int, payload: bytes = b'', cnt: int = 0) -> bytes:
+    header = struct.pack('<HHBH', 0, msg_id, cnt, len(payload))
     body = header + payload
     return body + struct.pack('<H', compute_crc(body))
+
+def build_ackn(cnt: int, msg_id: int) -> bytes:
+    """Acknowledge a connected-mode message (servers.php send_ackn): payload is the acked id."""
+    return build_packet(ACKN, struct.pack('<H', msg_id), cnt)
+
+# servers.php send_audio(): a 25-byte pseudo audio frame that makes a server open a channel
+AUDIO_PROBE = struct.pack('BBB', 0, 255, 254) + b'\0' * 22
 
 def parse_header(data: bytes):
     """Return (msg_id, cnt, payload) or None on CRC/length error."""
@@ -206,6 +252,31 @@ def ip_from_numip(n: int) -> str:
 
 def numip_of(ip_str: str) -> int:
     return struct.unpack('>I', socket.inet_aton(ip_str))[0]
+
+def numip_str(ip_str: str) -> str:
+    """servers.php's numip: '4:' + hex of the packed IPv4 ('6:' for IPv6, so v4 sorts first)."""
+    try:
+        return '4:' + socket.inet_pton(socket.AF_INET, ip_str).hex()
+    except OSError:
+        return '6:' + socket.inet_pton(socket.AF_INET6, ip_str).hex()
+
+_HOST_RE = re.compile(r'^([^\[:\]]+|\[(.*:.*:.*)\])(:(\d+))?$')   # servers.php parse_host()
+
+def parse_host(s: str):
+    """Return (host, port) exactly as servers.php parse_host(), or None when malformed."""
+    m = _HOST_RE.match(s or '')
+    if not m:
+        return None
+    host = m.group(2) if m.group(2) is not None else m.group(1)
+    return host, int(m.group(4)) if m.group(4) is not None else 22124
+
+def parse_features(payload: bytes) -> dict:
+    feat = struct.unpack_from('<I', payload)[0]
+    return {name: bool(feat & (1 << bit)) for bit, name in enumerate(FEATURE_BITS)}
+
+def parse_u16_string(payload: bytes) -> str:
+    n = struct.unpack_from('<H', payload)[0]
+    return payload[2:2 + n].decode('utf-8', errors='replace')
 
 # ── Version string parsing ────────────────────────────────────────────────────
 
@@ -381,24 +452,65 @@ def sweep_directory(host: str, port: int):
         # we send 1014. This is required for servers behind strict NAT — our outbound 1014
         # would be blocked if we skip the return ping.
         server_keys = {f"{s['ip']}:{s['port']}" for s in server_list}
-        probe_results = {}   # ip:port → {ping, nclients, clients}
+        probe_results = {}   # ip:port → {ping, nclients, clients, [os, version, versionsort, features, welcome, port2]}
         first_ping_sent = set()   # keys where we sent a return ping (awaiting 2nd response)
         clients_requested = set()
+        aliases = {}   # "ip:replyport" → listed key, for a server answering from another port
+        port2 = {}     # listed key → that reply port (servers.php's port2)
         ms = int(time.time() * 1000) % 86400000
         return_ping = build_packet(CLM_PING_MS_WITHNUMCLIENTS, struct.pack('<IB', ms, 0))
+        # servers.php fires these three at every server right after its second ping reply
+        info_requests = (build_packet(CLM_REQ_VERSION_AND_OS),
+                         build_packet(CLM_REQ_SERVER_FEATURES),
+                         build_packet(CLM_REQ_WELCOME_MESSAGE))
+
+        def _key_for(fip, fport):
+            """Listed key for a reply, or None. servers.php port2: a reply from a listed IP on an
+            unlisted port is taken for the one still-silent server at that IP."""
+            key = f"{fip}:{fport}"
+            if key in server_keys:
+                return key
+            if key in aliases:
+                return aliases[key]
+            cands = [k for k in server_keys
+                     if k.rsplit(':', 1)[0] == fip and k not in probe_results]
+            if len(cands) != 1:
+                return None
+            aliases[key] = cands[0]
+            port2[cands[0]] = fport
+            return cands[0]
+
+        def _apply_info(key, mid, payload):
+            """Version / features / welcome replies — the same fields the pool probe fills."""
+            pr = probe_results.get(key)
+            if pr is None:
+                return False
+            if mid == CLM_VERSION_AND_OS and len(payload) >= 3:
+                os_id, vlen = struct.unpack_from('<BH', payload)
+                pr['os'] = OPSYS.get(os_id, 'Unknown')
+                pr['version'], pr['versionsort'] = parse_version(
+                    payload[3:3 + vlen].decode('utf-8', errors='replace'))
+            elif mid == CLM_SERVER_FEATURES and len(payload) >= 4:
+                pr['features'] = parse_features(payload)
+            elif mid == CLM_WELCOME_MESSAGE and len(payload) >= 2:
+                pr['welcome'] = parse_u16_string(payload)
+            else:
+                return False
+            return True
 
         def _process_p2_packet(parsed, fip, fport):
             """Process one Phase 2 packet in-place (modifies probe_results etc.)."""
             mid, _, payload = parsed
-            key = f"{fip}:{fport}"
-            if key not in server_keys:
+            key = _key_for(fip, fport)
+            if key is None:
                 return
             if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
                 timems_r, nclients = struct.unpack_from('<IB', payload)
                 now_ms = int(time.time() * 1000) % 86400000
                 rtt = now_ms - timems_r
                 if key not in first_ping_sent:
-                    probe_results[key] = {'ping': 0, 'nclients': nclients, 'clients': []}
+                    probe_results[key] = {'ping': 0, 'nclients': nclients, 'clients': [],
+                                          'port2': port2.get(key)}
                     sock.sendto(return_ping, (fip, fport))
                     first_ping_sent.add(key)
                     if nclients > 0:
@@ -406,6 +518,8 @@ def sweep_directory(host: str, port: int):
                 else:
                     probe_results[key]['ping'] = rtt if 0 <= rtt < 30000 else 0
                     probe_results[key]['nclients'] = nclients
+                    for pkt in info_requests:
+                        sock.sendto(pkt, (fip, fport))
                     if nclients > 0 and key not in clients_requested:
                         sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
                         clients_requested.add(key)
@@ -413,6 +527,8 @@ def sweep_directory(host: str, port: int):
             elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
                 probe_results[key]['clients'] = _parse_client_list(payload)
                 print(f'[sweep] {host}:{port} got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
+            else:
+                _apply_info(key, mid, payload)
 
         # Replay pings buffered during Phase 1 before entering the live receive loop.
         for parsed_buf, (bip, bport) in phase1_buffered:
@@ -430,7 +546,7 @@ def sweep_directory(host: str, port: int):
                     _process_p2_packet(parsed, fip, fport)
                     if len(clients_requested) > prev_req:
                         deadline = max(deadline, time.time() + TIMEOUT_SEC * MAX_ATTEMPTS)
-                    elif fip + ':' + str(fport) in first_ping_sent - clients_requested:
+                    elif _key_for(fip, fport) in first_ping_sent - clients_requested:
                         deadline = max(deadline, time.time() + TIMEOUT_SEC)
             except socket.timeout:
                 clients_pending = any(
@@ -463,8 +579,8 @@ def sweep_directory(host: str, port: int):
                     if not parsed:
                         continue
                     mid, _, payload = parsed
-                    key = f"{fip}:{fport}"
-                    if key not in server_keys:
+                    key = _key_for(fip, fport)
+                    if key is None:
                         continue
                     if mid == CLM_PING_MS_WITHNUMCLIENTS and len(payload) >= 5:
                         if key in probe_results:
@@ -473,7 +589,11 @@ def sweep_directory(host: str, port: int):
                         now_ms = int(time.time() * 1000) % 86400000
                         rtt = now_ms - timems_r
                         probe_results[key] = {'ping': rtt if 0 <= rtt < 30000 else 0,
-                                              'nclients': nclients, 'clients': []}
+                                              'nclients': nclients, 'clients': [],
+                                              'port2': port2.get(key)}
+                        for pkt in info_requests:
+                            sock.sendto(pkt, (fip, fport))
+                        deadline = max(deadline, time.time() + TIMEOUT_SEC)
                         if nclients > 0 and key not in clients_requested:
                             sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (fip, fport))
                             clients_requested.add(key)
@@ -482,6 +602,8 @@ def sweep_directory(host: str, port: int):
                     elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
                         probe_results[key]['clients'] = _parse_client_list(payload)
                         print(f'[sweep] {host}:{port} phase3 got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
+                    else:
+                        _apply_info(key, mid, payload)
                 except socket.timeout:
                     clients_pending = any(
                         not probe_results[k]['clients']
@@ -493,9 +615,13 @@ def sweep_directory(host: str, port: int):
         return server_list, probe_results, None
 
 
-def probe_server(ip: str, port: int):
-    """Probe one server: 2-pass ping RTT, version, client list.
-    Returns result dict or None if unreachable."""
+def probe_server(ip: str, port: int, wait_optional: bool = True):
+    """Probe one server: 2-pass ping RTT, then servers.php's request burst — version, features,
+    welcome, client list. A reply from the same IP on another port is servers.php's "port2":
+    the conversation continues there and the row carries it. Features/welcome are optional
+    (pre-1019 servers never answer them): once the required replies are in they get one more
+    timeout, or none when wait_optional is False.
+    Returns result dict; ping=-1 if unreachable."""
     lport = _acquire_port()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(TIMEOUT_SEC)
@@ -503,17 +629,22 @@ def probe_server(ip: str, port: int):
         sock.bind(('0.0.0.0', lport))
 
         result = {'ping': -1, 'nclients': 0, 'clients': [],
-                  'version': '', 'versionsort': '', 'os': ''}
+                  'version': '', 'versionsort': '', 'os': '',
+                  'features': None, 'welcome': None, 'port2': None}
+        dst          = (ip, port)
         ping_pass    = 0     # 0=need 1st, 1=need 2nd, 2=done
         want_clients = False
         got_version  = False
         got_clients  = False
+        got_features = False
+        got_welcome  = False
+        grace        = None  # deadline for the optional replies once the required ones are in
         timeouts     = 0
 
         def send_ping():
             ms = int(time.time() * 1000) % 86400000
             sock.sendto(build_packet(CLM_PING_MS_WITHNUMCLIENTS,
-                                     struct.pack('<IB', ms, 0)), (ip, port))
+                                     struct.pack('<IB', ms, 0)), dst)
 
         send_ping()
 
@@ -529,9 +660,14 @@ def probe_server(ip: str, port: int):
                     continue
                 mid, _, payload = parsed
 
-                if mid == CLM_PING_MS_WITHNUMCLIENTS and fport == port:
+                if mid == CLM_PING_MS_WITHNUMCLIENTS:
                     if len(payload) < 5:
                         continue
+                    if fport != dst[1]:
+                        if ping_pass != 0:
+                            continue      # already in conversation on another port
+                        result['port2'] = fport
+                        dst = (ip, fport)
                     timems_r, nclients = struct.unpack_from('<IB', payload)
                     if ping_pass == 0:
                         ping_pass = 1
@@ -544,10 +680,11 @@ def probe_server(ip: str, port: int):
                         result['ping'] = now_ms - timems_r
                         result['nclients'] = nclients
                         want_clients = nclients > 0
-                        sock.sendto(build_packet(CLM_REQ_VERSION_AND_OS), (ip, port))
+                        sock.sendto(build_packet(CLM_REQ_VERSION_AND_OS), dst)
+                        sock.sendto(build_packet(CLM_REQ_SERVER_FEATURES), dst)
+                        sock.sendto(build_packet(CLM_REQ_WELCOME_MESSAGE), dst)
                         if want_clients:
-                            sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST),
-                                        (ip, port))
+                            sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), dst)
 
                 elif mid == CLM_VERSION_AND_OS:
                     if len(payload) < 3:
@@ -562,17 +699,35 @@ def probe_server(ip: str, port: int):
                     result['clients'] = _parse_client_list(payload)
                     got_clients = True
 
+                elif mid == CLM_SERVER_FEATURES and len(payload) >= 4:
+                    result['features'] = parse_features(payload)
+                    got_features = True
+
+                elif mid == CLM_WELCOME_MESSAGE and len(payload) >= 2:
+                    result['welcome'] = parse_u16_string(payload)
+                    got_welcome = True
+
                 if ping_pass == 2 and got_version and (not want_clients or got_clients):
+                    # Wait one timeout for BOTH optional replies. A server with no welcome text
+                    # still answers 1022 with an empty 1021, and servers.php then emits
+                    # welcome: "" — measured 2026-10-23 on 4 of 6 "missing" welcomes.
+                    if not wait_optional or (got_features and got_welcome):
+                        break
+                    if grace is None:
+                        grace = min(deadline, time.time() + TIMEOUT_SEC)
+                if grace is not None and time.time() >= grace:
                     break
 
             except socket.timeout:
+                if grace is not None:
+                    break             # required replies are in; the optional ones did not come
                 timeouts += 1
                 if timeouts >= MAX_ATTEMPTS:
                     break
                 if ping_pass == 0:
                     send_ping()
                 elif ping_pass == 2 and want_clients and not got_clients:
-                    sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), (ip, port))
+                    sock.sendto(build_packet(CLM_REQ_CONN_CLIENTS_LIST), dst)
 
         return result  # ping=-1 if unreachable; caller handles
     finally:
@@ -688,6 +843,16 @@ def _do_dir_task(dir_key: str):
     host, _, port_str = host_port.rpartition(':')
     port = int(port_str)
 
+    # A directory adopted on request is dropped once nobody has asked for it for REAP_AFTER;
+    # its servers then fall to the membership reaper like any unlisted server.
+    with _STATE_LOCK:
+        ds0 = DIRECTORY_STATE.get(host_port)
+        if ds0 and ds0.get('adopted') and time.time() - ds0.get('last_request_time', 0.0) > REAP_AFTER:
+            del DIRECTORY_STATE[host_port]
+            print(f'[dir] {host_port} adopted on request, unasked for {REAP_AFTER:.0f}s — dropped',
+                  file=sys.stderr, flush=True)
+            return
+
     servers, probe_results, err = sweep_directory(host, port)
     if err:
         print(f"[dir] sweep failed {host}:{port}: {err}", file=sys.stderr, flush=True)
@@ -695,15 +860,25 @@ def _do_dir_task(dir_key: str):
         return
 
     now = time.time()
+    new_keys = _apply_sweep(host, port, host_port, servers, probe_results, now)
+    _schedule(now + DIRECTORY_SWEEP, dir_key)
+    print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new, "
+          f"{len(probe_results)} pinged back", file=sys.stderr, flush=True)
+
+
+def _apply_sweep(host, port, host_port, servers, probe_results, now, adopted=False):
+    """Fold one directory sweep into DIRECTORY_STATE/SERVER_STATE and schedule the server
+    probes it calls for. Returns the keys of servers seen for the first time."""
     new_keys = []
     with _STATE_LOCK:
-        prev_sweep_count = DIRECTORY_STATE.get(host_port, {}).get('sweep_count', 0)
+        prev = DIRECTORY_STATE.get(host_port, {})
         DIRECTORY_STATE[host_port] = {
             'host': host, 'port': port,
             'servers': [f"{s['ip']}:{s['port']}" for s in servers],
             'last_sweep': now,
-            'sweep_count': prev_sweep_count + 1,
-            'last_request_time': DIRECTORY_STATE.get(host_port, {}).get('last_request_time', 0.0),
+            'sweep_count': prev.get('sweep_count', 0) + 1,
+            'last_request_time': prev.get('last_request_time', now if adopted else 0.0),
+            'adopted': prev.get('adopted', adopted),
         }
         for s in servers:
             key = f"{s['ip']}:{s['port']}"
@@ -719,6 +894,8 @@ def _do_dir_task(dir_key: str):
                     'hourly_events': [0] * 24,
                     '_cooldown': 0,
                     'os': '', 'version': '', 'versionsort': '',
+                    'features': None, 'welcome': None, 'port2': None,
+                    '_features_misses': 0,
                     '_min_probe': 0.0, '_last_probe_start': 0.0,
                     '_last_sweep_success': 0.0, '_last_listed': now,
                     '_probe_attempts': 0, '_probe_successes': 0,
@@ -744,6 +921,14 @@ def _do_dir_task(dir_key: str):
             ss = SERVER_STATE[key]
             ss['ping']     = pr['ping']
             ss['nclients'] = pr['nclients']
+            for f in ('os', 'version', 'versionsort'):
+                if pr.get(f):
+                    ss[f] = pr[f]
+            for f in ('features', 'welcome', 'port2'):      # an empty welcome IS a reply
+                if pr.get(f) is not None:
+                    ss[f] = pr[f]
+            if pr.get('features') is not None:
+                ss['_features_misses'] = 0
             ss['_probe_attempts']  += 1
             ss['_probe_successes'] += 1
             prev_sweep_time = ss['_last_probe_start']
@@ -785,9 +970,7 @@ def _do_dir_task(dir_key: str):
                     SERVER_STATE[key]['_min_probe'] = 0.0
                     _schedule(now, f"srv:{key}")
 
-    _schedule(now + DIRECTORY_SWEEP, dir_key)
-    print(f"[dir] {host}:{port} → {len(servers)} servers, {len(new_keys)} new, "
-          f"{len(probe_results)} pinged back", file=sys.stderr, flush=True)
+    return new_keys
 
 
 def _do_srv_task(srv_key: str):
@@ -821,12 +1004,15 @@ def _do_srv_task(srv_key: str):
             return  # stale heap entry — a probe already ran recently
         state['_min_probe'] = time.time() + 1.0  # prevent re-entry within 1s
         prev_probe_time = state['_last_probe_start']
+        # A server that has never answered CLM_REQ_SERVER_FEATURES is not made to wait for it
+        # on every probe; re-ask every 20th probe in case it was upgraded.
+        wait_opt = state.get('_features_misses', 0) < 3 or state['_probe_attempts'] % 20 == 0
 
     global _probes_total
     _probes_total += 1
     probe_start = time.time()
     try:
-        result = probe_server(ip, port)
+        result = probe_server(ip, port, wait_optional=wait_opt)
     except Exception as exc:
         print(f'[srv] {ip}:{port} probe exception: {exc}', file=sys.stderr, flush=True)
         with _STATE_LOCK:
@@ -873,6 +1059,16 @@ def _do_srv_task(srv_key: str):
                 state['os']          = result['os']
                 state['version']     = result['version']
                 state['versionsort'] = result['versionsort']
+            if probe_ok:
+                if result['features'] is not None:
+                    state['features'] = result['features']
+                    state['_features_misses'] = 0
+                elif wait_opt:
+                    state['_features_misses'] = min(state.get('_features_misses', 0) + 1, 99)
+                if result['welcome'] is not None:
+                    state['welcome'] = result['welcome']
+                if result['port2'] is not None:
+                    state['port2'] = result['port2']
 
             old_set = frozenset(
                 (c['name'], c['countryid'], c['instrumentid'], c['city'])
@@ -950,49 +1146,225 @@ def _scheduler_loop():
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
+def _client_rows(ss: dict) -> list:
+    """servers.php client objects, plus first_seen / last_absent (Unix floats) when known."""
+    rows = []
+    for c in ss['clients']:
+        fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
+        entry = dict(c)
+        fs = ss['first_seen'].get(fkey, 0.0)
+        if fs > 0.0:
+            entry['first_seen'] = fs
+        la = ss['last_absent'].get(fkey, 0.0)
+        if la > 0.0:
+            entry['last_absent'] = la
+        rows.append(entry)
+    return rows
+
+
+def _server_row(ss: dict, index: int, single: bool = False, name: str = None) -> dict:
+    """One row in servers.php's shape and key order.
+    Directory mode: the 14 keys set from the list entry and the ping reply, then the keys each
+    UDP reply adds (port2, nclients, features, welcome, clients), index last.
+    ?server= / ?query= mode: servers.php initialises index, name, numip, ip, port, ping, os,
+    version, versionsort first. nclients/clients appear only when the server answered."""
+    if single:
+        row = {'index': index, 'name': ss['name'] if name is None else name,
+               'numip': numip_str(ss['ip']), 'ip': ss['ip'], 'port': ss['port'],
+               'ping': ss['ping'], 'os': ss['os'], 'version': ss['version'],
+               'versionsort': ss['versionsort']}
+    else:
+        row = {'numip': numip_str(ss['ip']), 'port': ss['port'], 'countryid': ss['countryid'],
+               'maxclients': ss['maxclients'], 'perm': ss['perm'], 'country': ss['country'],
+               'name': ss['name'], 'ipaddrs': ss['ipaddrs'], 'city': ss['city'], 'ip': ss['ip'],
+               'ping': ss['ping'], 'os': ss['os'], 'version': ss['version'],
+               'versionsort': ss['versionsort']}
+    if ss.get('port2') is not None:
+        row['port2'] = ss['port2']
+    if ss['ping'] >= 0:
+        row['nclients'] = ss['nclients']
+    if ss.get('features') is not None:
+        row['features'] = ss['features']
+    if ss.get('welcome') is not None:
+        row['welcome'] = ss['welcome']
+    if ss['ping'] >= 0 and ss['clients']:
+        row['clients'] = _client_rows(ss)
+    if not single:
+        row['index'] = index
+    return row
+
+
 def _build_dir_rows(host_port: str, ds: dict, central: str = None) -> list:
     """Build the server-list JSON rows for one directory from current STATE (caller holds lock)."""
     result = []
-    for i, ip_port in enumerate(ds['servers']):
+    for ip_port in ds['servers']:
         ss = SERVER_STATE.get(ip_port)
         if not ss:
             continue
-        clients = []
-        for c in ss['clients']:
-            fkey = (c['name'], c['countryid'], c['instrumentid'], c['city'])
-            entry = {**c, 'first_seen': ss['first_seen'].get(fkey, 0.0)}
-            la = ss['last_absent'].get(fkey, 0.0)
-            if la > 0.0:
-                entry['last_absent'] = la
-            clients.append(entry)
-        row = {
-            'ip':          ss['ip'],
-            'port':        ss['port'],
-            'numip':       ss['numip'],
-            'name':        ss['name'],
-            'countryid':   ss['countryid'],
-            'country':     ss['country'],
-            'city':        ss['city'],
-            'maxclients':  ss['maxclients'],
-            'perm':        ss['perm'],
-            'ipaddrs':     ss['ipaddrs'],
-            'ping':        ss['ping'],
-            'nclients':    ss['nclients'],
-            'os':          ss['os'],
-            'version':     ss['version'],
-            'versionsort': ss['versionsort'],
-            'index':       i,
-        }
+        row = _server_row(ss, len(result))
         if central is not None:
             row['central'] = central
-        if clients:
-            row['clients'] = clients
         result.append(row)
     return result
 
 
+def _rows_from_sweep(servers: list, probe_results: dict) -> list:
+    """Directory rows straight from one sweep, for a directory we are not keeping."""
+    rows = []
+    for s in servers:
+        pr = probe_results.get(f"{s['ip']}:{s['port']}", {})
+        tmp = {**s, 'ping': pr.get('ping', -1), 'nclients': pr.get('nclients', 0),
+               'clients': pr.get('clients', []), 'os': pr.get('os', ''),
+               'version': pr.get('version', ''), 'versionsort': pr.get('versionsort', ''),
+               'features': pr.get('features'), 'welcome': pr.get('welcome'),
+               'port2': pr.get('port2'), 'first_seen': {}, 'last_absent': {}}
+        rows.append(_server_row(tmp, len(rows)))
+    return rows
+
+
+# ── servers.php request modes served on demand ────────────────────────────────
+
+_adopt_lock = threading.Lock()
+
+def _directory_rows_on_demand(host: str, port: int):
+    """?directory= for a directory we do not sample: sweep it now, as servers.php does on every
+    request, and if there is room adopt it into the loop until nobody has asked for REAP_AFTER.
+    None → caller answers ERR_NOT_FOUND (host does not resolve)."""
+    host_port = f"{host}:{port}"
+    try:
+        socket.gethostbyname(host)
+    except socket.gaierror:
+        return None
+    with _adopt_lock:                       # one on-demand sweep at a time
+        with _STATE_LOCK:
+            ds = DIRECTORY_STATE.get(host_port)
+        if ds is None:
+            servers, probe_results, err = sweep_directory(host, port)
+            if err:
+                print(f'[dir] on-demand sweep failed {host_port}: {err}', file=sys.stderr, flush=True)
+                return []
+            now = time.time()
+            with _STATE_LOCK:
+                room = sum(1 for d in DIRECTORY_STATE.values() if d.get('adopted')) < ADOPT_MAX
+            if not room:
+                return _rows_from_sweep(servers, probe_results)
+            _apply_sweep(host, port, host_port, servers, probe_results, now, adopted=True)
+            _schedule(now + DIRECTORY_SWEEP, f"dir:{host_port}")
+            print(f'[dir] {host_port} adopted on request → {len(servers)} servers',
+                  file=sys.stderr, flush=True)
+    with _STATE_LOCK:
+        ds = DIRECTORY_STATE.get(host_port)
+        if ds is None:
+            return []
+        ds['last_request_time'] = time.time()
+        return _build_dir_rows(host_port, ds)
+
+
+def _single_server_rows(host: str, port: int, name: str):
+    """?server= : a one-element list, or [] when the server never answered (servers.php deletes
+    it). Served from state when the server is listed and was probed in the last minute.
+    None → host does not resolve."""
+    try:
+        ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return None
+    label = host if name is None else name
+    key = f"{ip}:{port}"
+    with _STATE_LOCK:
+        ss = SERVER_STATE.get(key)
+        if ss and ss['ping'] >= 0 and time.time() - ss['_last_probe_start'] < 60.0:
+            return [_server_row(ss, 0, single=True, name=label)]
+        times = (dict(ss['first_seen']), dict(ss['last_absent'])) if ss else ({}, {})
+    r = probe_server(ip, port)
+    if r['ping'] < 0:
+        return []
+    tmp = {'ip': ip, 'port': port, 'name': label, 'ping': r['ping'], 'os': r['os'],
+           'version': r['version'], 'versionsort': r['versionsort'], 'nclients': r['nclients'],
+           'clients': r['clients'], 'features': r['features'], 'welcome': r['welcome'],
+           'port2': r['port2'], 'first_seen': times[0], 'last_absent': times[1]}
+    return [_server_row(tmp, 0, single=True, name=label)]
+
+
+def _query_welcome(ip: str, port: int) -> dict:
+    """?query= : servers.php's short audio connection. Send one pseudo audio frame, acknowledge
+    every connected-mode message, collect CLIENT_ID / RAWAUDIO_SUPPORTED / CHAT_TEXT (the welcome
+    text), then disconnect twice. Returns only what the server sent."""
+    out = {}
+    lport = _acquire_port()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(TIMEOUT_SEC)
+    try:
+        sock.bind(('0.0.0.0', lport))
+        sock.sendto(AUDIO_PROBE, (ip, port))
+        attempts, got_any = 1, False
+        deadline = time.time() + TIMEOUT_SEC * MAX_ATTEMPTS * 2
+        while time.time() < deadline:
+            try:
+                data, (fip, fport) = sock.recvfrom(32767)
+            except socket.timeout:
+                if got_any or attempts >= MAX_ATTEMPTS:
+                    break
+                attempts += 1
+                sock.sendto(AUDIO_PROBE, (ip, port))
+                continue
+            if fip != ip:
+                continue
+            parsed = parse_header(data)
+            if not parsed:
+                continue                  # audio frames back from the server, or garbage
+            got_any = True
+            mid, cnt, payload = parsed
+            if ACKN < mid < CLM_START:
+                sock.sendto(build_ackn(cnt, mid), (fip, fport))
+            if mid == CLIENT_ID and payload:
+                out['client_id'] = payload[0]
+            elif mid == RAWAUDIO_SUPPORTED:
+                out['rawaudio'] = True
+            elif mid == CHAT_TEXT and len(payload) >= 2:
+                out['welcome'] = parse_u16_string(payload)
+                break
+        for _ in range(2):
+            sock.sendto(build_packet(CLM_DISCONNECTION), (ip, port))
+        return out
+    finally:
+        sock.close()
+        _release_port(lport)
+
+
+def _query_rows(host: str, port: int, name: str):
+    """?query= row: servers.php's single-server initialisation plus whatever the audio
+    connection yielded. None → host does not resolve."""
+    try:
+        ip = socket.gethostbyname(host)
+    except socket.gaierror:
+        return None
+    row = {'index': 0, 'name': host if name is None else name, 'numip': numip_str(ip), 'ip': ip,
+           'port': port, 'ping': -1, 'os': '', 'version': '', 'versionsort': ''}
+    row.update(_query_welcome(ip, port))
+    return [row]
+
+
 class Handler(BaseHTTPRequestHandler):
+    timeout = 10        # per-connection socket timeout; a half-open client cannot hold a thread
+
     def do_GET(self):
+        try:
+            self._get()
+        except Exception as exc:            # never let a request take the worker down
+            print(f'[http] {self.address_string()} {self.path}: {exc!r}', file=sys.stderr, flush=True)
+            try:
+                self._send(500, {'error': 'internal error'})
+            except Exception:
+                pass
+
+    def _admin(self) -> bool:
+        """Operator-only routes: ADMIN_IPS, else 403."""
+        if self.client_address[0] in ADMIN_IPS:
+            return True
+        self._send(403, {'error': 'forbidden'})
+        return False
+
+    def _get(self):
         p = urlparse(self.path)
 
         if p.path == '/servers/all':
@@ -1004,6 +1376,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if p.path == '/stats':
+            if not self._admin():
+                return
             now_s   = time.time()
             elapsed = now_s - _probes_t0
             with _heap_lock:
@@ -1082,6 +1456,8 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if p.path == '/debug/stuck':
+            if not self._admin():
+                return
             with _STATE_LOCK:
                 stuck = [
                     {'ip_port': k, 'name': s['name'],
@@ -1092,52 +1468,87 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {'stuck_count': len(stuck), 'servers': stuck})
             return
 
-        if p.path != '/servers':
+        if p.path not in ('/servers', '/servers.php'):
             self._send(404, {'error': 'not found'}); return
 
-        qs  = parse_qs(p.query)
-        raw = (qs.get('central') or qs.get('directory') or [None])[0]
-        if not raw:
-            self._send(400, {'error': 'no directory specified'}); return
+        # servers.php parameter handling, in its order: ?central= is the old name for
+        # ?directory= and wins over it; then ?server=, then ?query=. &name= labels a single
+        # server; &pretty pretty-prints. Error bodies are servers.php's, always HTTP 200.
+        qs     = parse_qs(p.query, keep_blank_values=True)
+        pretty = 'pretty' in qs
+        name   = qs.get('name', [None])[0]
+        if 'central' in qs:
+            mode, raw = 'directory', qs['central'][0]
+        elif 'directory' in qs:
+            mode, raw = 'directory', qs['directory'][0]
+        elif 'server' in qs:
+            mode, raw = 'server', qs['server'][0]
+        elif 'query' in qs:
+            mode, raw = 'query', qs['query'][0]
+        else:
+            self._send(200, ERR_NO_TARGET, pretty); return
+        hp = parse_host(raw)
+        if hp is None:
+            self._send(200, ERR_INVALID, pretty); return
+        host, port = hp
+        if ':' in host:
+            # IPv6 literal: this sampler speaks IPv4; servers.php would try it and hear nothing
+            self._send(200, [], pretty); return
 
-        host, _, port_str = raw.rpartition(':')
-        if not host:
-            host, port_str = raw, '22124'
-        port      = int(port_str)
+        if mode == 'server':
+            rows = _single_server_rows(host, port, name)
+        elif mode == 'query':
+            rows = _query_rows(host, port, name)
+        else:
+            rows = self._directory_rows(host, port)
+        if rows is None:
+            self._send(200, ERR_NOT_FOUND, pretty); return
+        self._send(200, rows, pretty)
+
+    def _directory_rows(self, host: str, port: int):
+        """Known directory: answer from state and poke idle servers that are due. Unknown: sweep
+        it on demand. A known directory ALWAYS yields a list — jamfan26 passes it straight
+        through to a consumer that iterates it."""
         host_port = f"{host}:{port}"
-        dir_key   = f"dir:{host_port}"
-
         now_req = time.time()
         with _STATE_LOCK:
             ds = DIRECTORY_STATE.get(host_port)
             if ds is None:
-                self._send(200, [])
-                return
-            ds['last_request_time'] = now_req
-            result = _build_dir_rows(host_port, ds)
-            _idle_cap = _global_idle_cap_locked()
-            servers_to_poke = [
-                ip_port for ip_port in ds.get('servers', [])
-                if ip_port in SERVER_STATE
-                and SERVER_STATE[ip_port]['nclients'] == 0
-                and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _idle_cap
-                and SERVER_STATE[ip_port]['_min_probe'] <= now_req
-            ]
+                known = False
+            else:
+                known = True
+                ds['last_request_time'] = now_req
+                result = _build_dir_rows(host_port, ds)
+                _idle_cap = _global_idle_cap_locked()
+                servers_to_poke = [
+                    ip_port for ip_port in ds.get('servers', [])
+                    if ip_port in SERVER_STATE
+                    and SERVER_STATE[ip_port]['nclients'] == 0
+                    and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _idle_cap
+                    and SERVER_STATE[ip_port]['_min_probe'] <= now_req
+                ]
+        if not known:
+            return _directory_rows_on_demand(host, port)
 
         for ip_port in servers_to_poke:
             with _STATE_LOCK:
                 if ip_port in SERVER_STATE:
                     SERVER_STATE[ip_port]['_min_probe'] = 0.0
             _schedule(now_req, f'srv:{ip_port}')
-
-        self._send(200, result)
+        return result
 
     def do_POST(self):
-        p = urlparse(self.path)
-        if p.path == '/ping-density':
+        try:
+            p = urlparse(self.path)
+            if p.path != '/ping-density':
+                self._send(404, {'error': 'not found'}); return
+            if not self._admin():
+                return
             global _active_pool, _active_pool_ts, _today_peak
             length = int(self.headers.get('Content-Length', 0))
-            body   = self.rfile.read(length)
+            if length > 4096:
+                self._send(413, {'error': 'too large'}); return
+            body = self.rfile.read(length)
             try:
                 d = json.loads(body)
                 _active_pool    = int(d['active_pool'])
@@ -1148,11 +1559,21 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {'ok': True, 'active_pool': _active_pool})
             except Exception as exc:
                 self._send(400, {'error': str(exc)})
-            return
-        self._send(404, {'error': 'not found'})
+        except Exception as exc:
+            print(f'[http] {self.address_string()} POST {self.path}: {exc!r}', file=sys.stderr, flush=True)
+            try:
+                self._send(500, {'error': 'internal error'})
+            except Exception:
+                pass
 
-    def _send(self, code, data):
-        body = (json.dumps(data, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
+    def _send(self, code, data, pretty: bool = False):
+        # servers.php: JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES, trailing newline;
+        # &pretty adds JSON_PRETTY_PRINT (4-space indent, ": " and ",\n" separators).
+        if pretty:
+            text = json.dumps(data, ensure_ascii=False, indent=4)
+        else:
+            text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+        body = (text + '\n').encode()
         self.send_response(code)
         self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(body)))
@@ -1183,6 +1604,11 @@ if __name__ == '__main__':
         _schedule(now, f"dir:{d}")
     threading.Thread(target=_scheduler_loop, daemon=True, name='scheduler').start()
     threading.Thread(target=_midnight_rollover_loop, daemon=True, name='midnight-rollover').start()
-    srv = HTTPServer(('0.0.0.0', 5001), Handler)
-    print('jamulus-sampler daemon on :5001', flush=True)
+    # Threaded: one slow or half-open client no longer stalls every other caller (measured on
+    # the single-threaded server 2026-10-23: a second client got nothing until the first closed).
+    srv = ThreadingHTTPServer(('0.0.0.0', HTTP_PORT), Handler)
+    srv.daemon_threads = True
+    print(f'jamulus-sampler daemon on :{HTTP_PORT} (udp {SWEEP_PORT}, pool '
+          f'{CLIENT_PORT_START}-{CLIENT_PORT_START + CLIENT_PORT_RANGE - 1}, admin {sorted(ADMIN_IPS)})',
+          flush=True)
     srv.serve_forever()
