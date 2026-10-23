@@ -615,14 +615,17 @@ def sweep_directory(host: str, port: int):
         return server_list, probe_results, None
 
 
-def probe_server(ip: str, port: int, wait_optional: bool = True):
+def probe_server(ip: str, port: int, wait_optional: bool = True, pooled: bool = True):
     """Probe one server: 2-pass ping RTT, then servers.php's request burst — version, features,
     welcome, client list. A reply from the same IP on another port is servers.php's "port2":
     the conversation continues there and the row carries it. Features/welcome are optional
     (pre-1019 servers never answer them): once the required replies are in they get one more
     timeout, or none when wait_optional is False.
+    pooled=False binds an ephemeral port instead of waiting for one of the 15 pool ports: the
+    on-demand ?server= path must answer in seconds, and on the production host the pool runs
+    at 15/15 (measured 2026-10-23: a ?server= request waited >25 s behind the probe backlog).
     Returns result dict; ping=-1 if unreachable."""
-    lport = _acquire_port()
+    lport = _acquire_port() if pooled else 0
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(TIMEOUT_SEC)
     try:
@@ -732,7 +735,8 @@ def probe_server(ip: str, port: int, wait_optional: bool = True):
         return result  # ping=-1 if unreachable; caller handles
     finally:
         sock.close()
-        _release_port(lport)
+        if pooled:
+            _release_port(lport)
 
 # ── Global state ──────────────────────────────────────────────────────────────
 
@@ -1275,7 +1279,7 @@ def _single_server_rows(host: str, port: int, name: str):
         if ss and ss['ping'] >= 0 and time.time() - ss['_last_probe_start'] < 60.0:
             return [_server_row(ss, 0, single=True, name=label)]
         times = (dict(ss['first_seen']), dict(ss['last_absent'])) if ss else ({}, {})
-    r = probe_server(ip, port)
+    r = probe_server(ip, port, pooled=False)
     if r['ping'] < 0:
         return []
     tmp = {'ip': ip, 'port': port, 'name': label, 'ping': r['ping'], 'os': r['os'],
@@ -1290,11 +1294,10 @@ def _query_welcome(ip: str, port: int) -> dict:
     every connected-mode message, collect CLIENT_ID / RAWAUDIO_SUPPORTED / CHAT_TEXT (the welcome
     text), then disconnect twice. Returns only what the server sent."""
     out = {}
-    lport = _acquire_port()
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)   # ephemeral port: never waits on the pool
     sock.settimeout(TIMEOUT_SEC)
     try:
-        sock.bind(('0.0.0.0', lport))
+        sock.bind(('0.0.0.0', 0))
         sock.sendto(AUDIO_PROBE, (ip, port))
         attempts, got_any = 1, False
         deadline = time.time() + TIMEOUT_SEC * MAX_ATTEMPTS * 2
@@ -1328,7 +1331,6 @@ def _query_welcome(ip: str, port: int) -> dict:
         return out
     finally:
         sock.close()
-        _release_port(lport)
 
 
 def _query_rows(host: str, port: int, name: str):
