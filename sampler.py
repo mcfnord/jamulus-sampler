@@ -38,6 +38,10 @@ ADMIN_IPS = {'127.0.0.1'} | {
 ADOPT_MAX         = int(os.environ.get('SAMPLER_ADOPT_MAX', '8'))  # directories beyond DIRECTORIES that requests may make us sample
 ONDEMAND_COOLDOWN = 60.0   # s — at most one request-driven sweep per unknown directory per minute
 DIR_ADDR_TTL      = 300.0  # s — how long a configured directory's resolved address is trusted for alias matching
+RAW_TTL           = 86400.0  # s — re-ask a server whether it supports raw audio once a day (or when its version changes)
+RAW_RETRY         = 1800.0   # s — a raw-audio ask that opened no channel is retried after this
+RAW_PER_SWEEP     = int(os.environ.get('SAMPLER_RAW_PER_SWEEP', '4'))  # raw-audio asks per scheduled sweep (0 = off)
+RAW_WAIT          = 1.5      # s — how long one sweep's raw-audio asks wait for CLIENT_ID / RAWAUDIO_SUPPORTED
 ONDEMAND_PORTS    = 4      # UDP ports above the probe pool, reserved for ?server= / ?query=
 
 # ── Protocol constants ────────────────────────────────────────────────────────
@@ -468,12 +472,14 @@ def _parse_client_list(payload: bytes) -> list:
 
 # ── UDP operations ────────────────────────────────────────────────────────────
 
-def sweep_directory(host: str, port: int, ip: str = None):
+def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = False):
     """Ask a directory for its list, then hear from its servers on the same socket: the directory
     tells each one to contact our source port, which is the NAT hole-punch that makes them
     reachable. Returns (server_list, probe_results, None) or (None, None, error_str).
     probe_results: 'ip:port' → a no_reply() dict filled in as the server answers (ping, nclients,
     clients, port2, and os/version/versionsort/features/welcome when it answered the info requests).
+    probe_raw (scheduled sweeps only): also ask a few servers whether they support raw audio
+    (_ask_raw_audio), recorded as probe_results[key]['_raw'].
     """
     ip = ip or resolve_ipv4(host)
     if ip is None:
@@ -668,7 +674,73 @@ def sweep_directory(host: str, port: int, ip: str = None):
                     if not _clients_pending():
                         break
 
+        if probe_raw:
+            _ask_raw_audio(sock, probe_results, port2, f'{host}:{port}')
         return server_list, probe_results, None
+
+
+def _raw_due(key: str, now: float) -> bool:
+    """A server is due a raw-audio ask when it never answered one, its answer is older than
+    RAW_TTL, or its version string changed since (a new binary may add or drop --noraw)."""
+    with _STATE_LOCK:
+        ss = SERVER_STATE.get(key)
+        if ss is None:
+            return True
+        if now < ss.get('_raw_due_at', 0.0):
+            return ss.get('_raw_version') not in (None, ss.get('version'))
+        return True
+
+
+def _ask_raw_audio(sock, probe_results: dict, port2: dict, label: str):
+    """Ask up to RAW_PER_SWEEP servers that answered THIS sweep whether they support raw audio,
+    from the sweep socket while its hole-punch is open. Measured 2026-10-24: servers behind a
+    stateful cloud firewall drop every unsolicited packet from any source; after a directory list
+    request on the same socket they answer pings and the audio connection alike, so ?query='s
+    fresh on-demand port never reaches them and this path does. Runs after every client list is collected, so the
+    short-lived channel it opens is never in a list this sweep reports. The ask is servers.php's
+    ?query= connection (the 25-byte frame; RAWAUDIO_SUPPORTED arrives right after CLIENT_ID),
+    acknowledged and closed with two CLM_DISCONNECTION. Result in probe_results[key]['_raw']:
+    True / False (a channel opened, no RAWAUDIO_SUPPORTED) / None (no channel: retried later)."""
+    if RAW_PER_SWEEP <= 0:
+        return
+    now = time.time()
+    due = [k for k in probe_results if probe_results[k]['ping'] >= 0 and _raw_due(k, now)][:RAW_PER_SWEEP]
+    if not due:
+        return
+    addr = {}                                   # (ip, reply port) → listed key
+    for k in due:
+        ip, lp = k.rsplit(':', 1)
+        addr[(ip, port2.get(k) or int(lp))] = k
+        probe_results[k]['_raw'] = None
+    for a in addr:
+        sock.sendto(AUDIO_PROBE, a)
+    opened, deadline = set(), time.time() + RAW_WAIT
+    while time.time() < deadline:
+        try:
+            data, src = sock.recvfrom(32767)
+        except socket.timeout:
+            continue
+        k = addr.get(src)
+        parsed = parse_header(data) if k else None
+        if not parsed:
+            continue                            # audio frames back, or another server's late reply
+        mid, cnt, _ = parsed
+        if ACKN < mid < CLM_START:
+            sock.sendto(build_ackn(cnt, mid), src)
+        if mid == CLIENT_ID:
+            opened.add(k)
+            if probe_results[k]['_raw'] is None:
+                probe_results[k]['_raw'] = False
+        elif mid == RAWAUDIO_SUPPORTED:
+            opened.add(k)
+            probe_results[k]['_raw'] = True
+        if all(probe_results[x]['_raw'] for x in due):
+            break
+    for a in addr:
+        for _ in range(2):
+            sock.sendto(DISCONNECTION_PKT, a)
+    print(f'[raw] {label}: asked {len(due)}, channel {len(opened)}, raw '
+          f'{sum(1 for x in due if probe_results[x]["_raw"])}', file=sys.stderr, flush=True)
 
 
 def probe_server(ip: str, port: int, wait_optional: bool = True, pool: _PortPool = PROBE_POOL,
@@ -893,7 +965,7 @@ def _do_dir_task(dir_key: str):
                   file=sys.stderr, flush=True)
             return
 
-    servers, probe_results, err = sweep_directory(host, port)
+    servers, probe_results, err = sweep_directory(host, port, probe_raw=True)
     if err:
         print(f"[dir] sweep failed {host}:{port}: {err}", file=sys.stderr, flush=True)
         _schedule(time.time() + DIRECTORY_SWEEP, dir_key)
@@ -922,6 +994,14 @@ def _merge_probe_fields(ss: dict, pr: dict, asked_optional: bool = True):
         if pr.get(f) is not None:
             ss[f] = pr[f]
     ss['port2'] = pr.get('port2')
+    if '_raw' in pr:                    # a raw-audio ask ran in this exchange (_ask_raw_audio)
+        now = time.time()
+        if pr['_raw'] is None:          # no channel opened: ask again after RAW_RETRY
+            ss['_raw_due_at'] = now + RAW_RETRY
+        else:
+            ss['rawaudio'] = pr['_raw']
+            ss['_raw_due_at'] = now + RAW_TTL
+            ss['_raw_version'] = ss.get('version') or None
     if pr.get('features') is not None and pr.get('welcome') is not None:
         ss['_features_misses'] = 0
     elif asked_optional:
@@ -1224,6 +1304,11 @@ def _server_row(ss: dict, index: int, single: bool = False, name: str = None) ->
     if ss['ping'] >= 0 and ss['clients']:
         row['clients'] = _client_rows(ss)
     if not single:
+        # The sampler's addition (index stays last, as servers.php appends it): does the server
+        # open raw (uncompressed) audio to a client? servers.php has this only in ?query= rows;
+        # here it comes from _ask_raw_audio. Absent until asked. jamulus.live's MAX sash reads it.
+        if ss.get('rawaudio') is not None:
+            row['rawaudio'] = ss['rawaudio']
         row['index'] = index
     return row
 

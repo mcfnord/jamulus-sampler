@@ -47,6 +47,7 @@ SERVER_OPTIONAL = {'features', 'welcome', 'port2'}          # present only when 
 CLIENT_ORDER = ['chanid', 'countryid', 'instrumentid', 'skillid', 'country', 'instrument', 'skill',
                 'name', 'city']
 CLIENT_EXTRA = ['first_seen', 'last_absent']                 # the sampler's additions, floats, at the end
+SERVER_EXTRA = ('rawaudio',)    # the sampler's addition to directory rows (bool, before index); servers.php has it in ?query= only
 SINGLE_ORDER = ['index', 'name', 'numip', 'ip', 'port', 'ping', 'os', 'version', 'versionsort', 'nclients']
 QUERY_KEYS = {'index', 'name', 'numip', 'ip', 'port', 'ping', 'os', 'version', 'versionsort',
               'client_id', 'rawaudio', 'welcome'}
@@ -133,7 +134,10 @@ def check_directory(ctx, d, s_rows, e_rows):
     for r in s_rows:
         keys = list(r)
         before = len(FAILS)
-        check_order(f'{label} {r.get("ip")}:{r.get("port")}', keys, SERVER_ORDER, unordered=SERVER_MIDDLE)
+        check_order(f'{label} {r.get("ip")}:{r.get("port")}', keys, SERVER_ORDER, unordered=SERVER_MIDDLE,
+                    allowed_extra=SERVER_EXTRA)
+        if 'rawaudio' in r and not isinstance(r['rawaudio'], bool):
+            fail(f'{label} {r.get("ip")}:{r.get("port")}: rawaudio={r["rawaudio"]!r}, the sampler gives a bool')
         bad_sorder += len(FAILS) - before
         for k, v in r.items():
             if k in e_types and type(v).__name__ not in e_types[k]:
