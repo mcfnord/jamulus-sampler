@@ -28,7 +28,11 @@ answers from that memory. The HTTP surface is a drop-in for softins' `servers.ph
    probe pool.** The 15 pool ports run saturated on a busy host; `?server=` and `?query=` use their
    own four on-demand ports (`ONDEMAND_PORTS`) and a request-driven directory sweep is rate-limited
    (`ONDEMAND_COOLDOWN`) and serialised (`_adopt_lock`) so a client cannot starve the scheduler or
-   turn the daemon into a UDP scanner.
+   turn the daemon into a UDP scanner. **A directory is its resolved address, not its spelling:**
+   `canonical_directory()` maps any name at a configured directory's ip:port (`.app` for `.io`) onto
+   that directory's state, and inside the cooldown the held rows are answered, never `[]` for a
+   directory that answered. 2026-10-24: with all `ADOPT_MAX` slots taken by duplicates, the `.app`
+   names answered `[]` on every repeat inside a minute (softins' report).
 5. **The hole-punch is answered.** A directory introduction arrives as `CLM_EMPTY_MESSAGE` (1009)
    from the server's real port; the sweep answers it with a ping. Without that, no server behind NAT
    is ever reached and `port2` can never be observed. The firewall must allow inbound UDP to the

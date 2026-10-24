@@ -35,8 +35,9 @@ UDP_BASE  = int(os.environ.get('SAMPLER_UDP_BASE', '22134'))
 ADMIN_IPS = {'127.0.0.1'} | {
     a.strip() for a in os.environ.get('SAMPLER_ADMIN_IPS', '').split(',') if a.strip()
 }
-ADOPT_MAX         = 8      # directories beyond DIRECTORIES that requests may make us sample
+ADOPT_MAX         = int(os.environ.get('SAMPLER_ADOPT_MAX', '8'))  # directories beyond DIRECTORIES that requests may make us sample
 ONDEMAND_COOLDOWN = 60.0   # s — at most one request-driven sweep per unknown directory per minute
+DIR_ADDR_TTL      = 300.0  # s — how long a configured directory's resolved address is trusted for alias matching
 ONDEMAND_PORTS    = 4      # UDP ports above the probe pool, reserved for ?server= / ?query=
 
 # ── Protocol constants ────────────────────────────────────────────────────────
@@ -1255,33 +1256,56 @@ def _rows_from_sweep(servers: list, probe_results: dict) -> list:
 
 _adopt_lock = threading.Lock()          # one request-driven sweep at a time
 _ondemand_seen: dict = {}                # "host:port" → time of its last request-driven sweep (under _STATE_LOCK)
+_ondemand_rows: dict = {}                # "host:port" → rows of that sweep, answered until the cooldown ends (under _STATE_LOCK)
+_dir_addr_cache: dict = {}               # configured "host:port" → (ip or None, resolved_at)
 
-def _directory_rows_on_demand(host: str, port: int):
+def canonical_directory(ip: str, port: int):
+    """The configured directory at this resolved address, or None. The directories answer under
+    more than one name — jazz.jamulus.app:22324 and jazz.jamulus.io:22324 are one host (upstream
+    global.h names them .app; DIRECTORIES names them .io) — so a request by any name for a
+    configured directory's address is served from that directory's state instead of being swept
+    on demand. Measured 2026-10-24: with the adopt slots full, the .app names answered [] on every
+    repeat inside ONDEMAND_COOLDOWN. Resolutions are cached DIR_ADDR_TTL; only the unknown-directory
+    path pays for them."""
+    now = time.time()
+    for hp in DIRECTORIES:
+        h, _, p = hp.rpartition(':')
+        if int(p) != port:
+            continue
+        cached = _dir_addr_cache.get(hp)
+        if cached is None or now - cached[1] > DIR_ADDR_TTL:
+            cached = (resolve_ipv4(h), now)
+            _dir_addr_cache[hp] = cached
+        if cached[0] == ip:
+            return hp
+    return None
+
+def _directory_rows_on_demand(host: str, port: int, ip: str):
     """?directory= for a directory we do not sample: sweep it now, as servers.php does on every
     request, and if there is room adopt it into the loop until nobody has asked for REAP_AFTER.
     A configured directory whose first sweep is not in yet is NOT adopted (that would create a
     second scheduler token for it): it answers [] until the sweep lands. Request-driven sweeps are
     limited to one per directory per ONDEMAND_COOLDOWN and never run concurrently, so a client
-    cannot turn the sampler into a UDP scanner or starve the scheduled sweeps of the shared socket.
-    None → caller answers ERR_NOT_FOUND (host does not resolve)."""
+    cannot turn the sampler into a UDP scanner or starve the scheduled sweeps of the shared socket;
+    inside the cooldown the rows of the last sweep are answered, never [] for a directory that
+    answered (servers.php sweeps afresh on every request). `ip` is the host's resolved address."""
     host_port = f"{host}:{port}"
     if host_port in DIRECTORIES:
         return []
-    ip = resolve_ipv4(host)
-    if ip is None:
-        return None
     now = time.time()
     with _STATE_LOCK:
         ds = DIRECTORY_STATE.get(host_port)
         if ds is None:
             if now - _ondemand_seen.get(host_port, 0.0) < ONDEMAND_COOLDOWN:
-                return []                   # swept for a request within the minute; not adopted then
+                return _ondemand_rows.get(host_port, [])   # swept for a request within the minute; not adopted then
             for k in [k for k, t in _ondemand_seen.items() if now - t >= ONDEMAND_COOLDOWN]:
-                del _ondemand_seen[k]       # the map holds at most a minute's distinct hosts
+                del _ondemand_seen[k]       # the maps hold at most a minute's distinct hosts
+                _ondemand_rows.pop(k, None)
             _ondemand_seen[host_port] = now
     if ds is None:
         if not _adopt_lock.acquire(timeout=TIMEOUT_SEC * MAX_ATTEMPTS):
-            return []                       # another request's sweep is running (servers.php would time out)
+            with _STATE_LOCK:               # another request's sweep is running (servers.php would time out)
+                return _ondemand_rows.get(host_port, [])
         try:
             servers, probe_results, err = sweep_directory(host, port, ip)
             if err:
@@ -1289,10 +1313,16 @@ def _directory_rows_on_demand(host: str, port: int):
                 return []
             now = time.time()
             with _STATE_LOCK:   # re-checked under the lock: a scheduled sweep may have landed meanwhile
-                room = (DIRECTORY_STATE.get(host_port) is None
-                        and sum(1 for d in DIRECTORY_STATE.values() if d.get('adopted')) < ADOPT_MAX)
+                n_adopted = sum(1 for d in DIRECTORY_STATE.values() if d.get('adopted'))
+                room = DIRECTORY_STATE.get(host_port) is None and n_adopted < ADOPT_MAX
             if not room:
-                return _rows_from_sweep(servers, probe_results)
+                rows = _rows_from_sweep(servers, probe_results)
+                with _STATE_LOCK:
+                    _ondemand_rows[host_port] = rows
+                print(f'[dir] {host_port} swept on request → {len(servers)} servers, not adopted '
+                      f'({n_adopted}/{ADOPT_MAX} adopt slots in use); rows held {ONDEMAND_COOLDOWN:.0f}s',
+                      file=sys.stderr, flush=True)
+                return rows
             _apply_sweep(host, port, host_port, servers, probe_results, now, adopted=True)
             _schedule(now + DIRECTORY_SWEEP, f"dir:{host_port}")
             print(f'[dir] {host_port} adopted on request → {len(servers)} servers',
@@ -1584,7 +1614,15 @@ class Handler(BaseHTTPRequestHandler):
                     and SERVER_STATE[ip_port]['_min_probe'] <= now_req
                 ]
         if ds is None:
-            return _directory_rows_on_demand(host, port)
+            ip = resolve_ipv4(host)
+            if ip is None:
+                return None                 # ERR_NOT_FOUND, as servers.php
+            canon = canonical_directory(ip, port)
+            if canon is not None and canon != host_port:
+                # another name for a configured directory (jazz.jamulus.app == jazz.jamulus.io)
+                ch, _, cp = canon.rpartition(':')
+                return self._directory_rows(ch, int(cp))
+            return _directory_rows_on_demand(host, port, ip)
 
         for ip_port in servers_to_poke:
             with _STATE_LOCK:

@@ -30,8 +30,8 @@ DIRECTORIES = [
     'rock.jamulus.io:22424', 'jazz.jamulus.io:22324', 'classical.jamulus.io:22524',
     'choral.jamulus.io:22724',
 ]
-# A DNS alias of the first directory: resolves, is not configured, and so exercises the on-demand
-# sweep-and-adopt path with a known answer (the same servers as anygenre1).
+# Another name for the first directory (upstream's .app spelling): resolves to its address, is not
+# in DIRECTORIES, and so exercises canonical_directory() — served from anygenre1's state, no sweep.
 UNCONFIGURED_ALIAS = 'anygenre1.jamulus.app:22124'
 
 # servers.php grammar, read off explorer.jamulus.io on 2026-10-23 (softins/jamulus-php b5462bf).
@@ -205,14 +205,20 @@ def check_modes(args, a_server, pass1):
             fail(f'[known dir {d}] sampler {st}, body not a list')
     if not any('[known dir' in f for f in FAILS):
         ok('[known dirs] all 7 answered 200 with a list')
-    # on-demand sweep of an unconfigured directory (the alias), then a second request served from state
+    # another name for a configured directory: served from that directory's state, not swept
+    # (a sweep takes seconds; state answers in milliseconds), with the same server set
     if not args.control:
         t0 = time.time(); st, _, body, rows = get_json(sampler_url(S, f'directory={UNCONFIGURED_ALIAS}'), timeout=90); t1 = time.time() - t0
         if st != 200 or not isinstance(rows, list) or not rows:
-            fail(f'[on-demand dir] sampler {st} {body[:60]!r} after {t1:.1f}s; servers.php: a list for any directory that answers')
+            fail(f'[alias dir] sampler {st} {body[:60]!r} after {t1:.1f}s; servers.php: a list for any directory that answers')
         else:
-            t0 = time.time(); st2, _, body2 = get(sampler_url(S, f'directory={UNCONFIGURED_ALIAS}')); t2 = time.time() - t0
-            (ok if st2 == 200 and t2 < t1 else warn)(f'[on-demand dir] first request {len(rows)} rows in {t1:.1f}s, second in {t2:.2f}s (adopted: served from state)')
+            base = pass1.get(DIRECTORIES[0], (0, {}, []))[2]
+            same = {(r.get('ip'), r.get('port')) for r in rows} == {(r.get('ip'), r.get('port')) for r in base}
+            if t1 >= 1.0:
+                fail(f'[alias dir] {UNCONFIGURED_ALIAS} took {t1:.1f}s: swept on demand, not served from {DIRECTORIES[0]} state')
+            else:
+                (ok if same else warn)(f'[alias dir] {UNCONFIGURED_ALIAS} {len(rows)} rows in {t1*1000:.0f} ms from state; '
+                                       f'server set {"==" if same else "!="} {DIRECTORIES[0]} ({len(base)} rows)')
     # pretty
     st, _, body = get(sampler_url(S, f'directory={DIRECTORIES[0]}&pretty'))
     newlines = body.count(b'\n')

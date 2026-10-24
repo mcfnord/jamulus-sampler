@@ -101,7 +101,10 @@ ports above it):
 | 22150–22153 (`ONDEMAND_PORTS`) | `?server=` and `?query=` requests, so they never queue behind the probe pool. |
 
 A request for a directory that is not configured is swept on demand, like `servers.php` does on
-every request, at most once a minute per directory and never two at once.
+every request, at most once a minute per directory and never two at once; inside that minute the
+last sweep's rows are answered. A name that resolves to a configured directory's address
+(`jazz.jamulus.app:22324` is `jazz.jamulus.io:22324`; upstream names the directories `.app`) is
+served from that directory's state, not swept.
 
 **The firewall must allow inbound UDP to the whole block (22134–22153 by default) from any
 address and any port.** When the sampler asks a directory for its list, the directory tells every
