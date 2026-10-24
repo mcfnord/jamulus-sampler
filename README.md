@@ -64,7 +64,8 @@ gets 403. Everything else is public and read-only, served from memory by a threa
 
 Environment knobs: `SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket, with the
 15 probe ports and 4 on-demand ports above it), `SAMPLER_ADMIN_IPS` (comma-separated; with none
-set, the admin routes answer only to localhost).
+set, the admin routes answer only to localhost). `SAMPLER_VERBOSE=1` logs every HTTP request and every
+per-server sweep step (off by default: only failed requests and an hourly request count).
 
 Example:
 

@@ -15,6 +15,7 @@ probe-pool ports and 4 on-demand ports above it), SAMPLER_ADMIN_IPS (comma list 
 POST /ping-density and read /stats, /debug/stuck; 127.0.0.1 is always allowed).
 """
 
+import collections
 import heapq
 import json
 import os
@@ -35,6 +36,7 @@ UDP_BASE  = int(os.environ.get('SAMPLER_UDP_BASE', '22134'))
 ADMIN_IPS = {'127.0.0.1'} | {
     a.strip() for a in os.environ.get('SAMPLER_ADMIN_IPS', '').split(',') if a.strip()
 }
+VERBOSE   = os.environ.get('SAMPLER_VERBOSE', '') not in ('', '0')  # per-server sweep lines + every HTTP request
 ADOPT_MAX         = int(os.environ.get('SAMPLER_ADOPT_MAX', '8'))  # directories beyond DIRECTORIES that requests may make us sample
 ONDEMAND_COOLDOWN = 60.0   # s — at most one request-driven sweep per unknown directory per minute
 DIR_ADDR_TTL      = 300.0  # s — how long a configured directory's resolved address is trusted for alias matching
@@ -570,7 +572,7 @@ def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = Fals
                 if key not in first_ping_sent and key not in punched:
                     punched.add(key)
                     sock.sendto(ping_packet(), (fip, fport))
-                    if key in port2:
+                    if VERBOSE and key in port2:
                         print(f'[sweep] {host}:{port} hello (1009) from {fip}:{fport} for {key}: port2={fport}',
                               file=sys.stderr, flush=True)
                 return key
@@ -581,7 +583,7 @@ def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = Fals
                     probe_results[key] = dict(no_reply(), ping=0, nclients=nclients, port2=port2.get(key))
                     sock.sendto(ping_packet(), (fip, fport))
                     first_ping_sent.add(key)
-                    if nclients > 0:
+                    if VERBOSE and nclients > 0:
                         print(f'[sweep] {host}:{port} 1st ping from {key} nclients={nclients} sent_return_ping', file=sys.stderr, flush=True)
                 else:
                     probe_results[key]['ping'] = rtt if 0 <= rtt < 30000 else 0
@@ -591,10 +593,12 @@ def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = Fals
                     if nclients > 0 and key not in clients_requested:
                         sock.sendto(REQ_CLIENTS_PKT, (fip, fport))
                         clients_requested.add(key)
-                        print(f'[sweep] {host}:{port} 2nd ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
+                        if VERBOSE:
+                            print(f'[sweep] {host}:{port} 2nd ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
             elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
                 probe_results[key]['clients'] = _parse_client_list(payload)
-                print(f'[sweep] {host}:{port} got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
+                if VERBOSE:
+                    print(f'[sweep] {host}:{port} got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
             elif key in probe_results:
                 apply_reply_info(probe_results[key], mid, payload)
             return key
@@ -667,10 +671,12 @@ def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = Fals
                             sock.sendto(REQ_CLIENTS_PKT, (fip, fport))
                             clients_requested.add(key)
                             deadline = max(deadline, time.time() + TIMEOUT_SEC * MAX_ATTEMPTS)
-                            print(f'[sweep] {host}:{port} phase3 ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
+                            if VERBOSE:
+                                print(f'[sweep] {host}:{port} phase3 ping from {key} nclients={nclients} sent_1014', file=sys.stderr, flush=True)
                     elif mid == CLM_CONN_CLIENTS_LIST and key in probe_results:
                         probe_results[key]['clients'] = _parse_client_list(payload)
-                        print(f'[sweep] {host}:{port} phase3 got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
+                        if VERBOSE:
+                            print(f'[sweep] {host}:{port} phase3 got 1013 from {key} clients={len(probe_results[key]["clients"])}', file=sys.stderr, flush=True)
                     elif key in probe_results:
                         apply_reply_info(probe_results[key], mid, payload)
                 except socket.timeout:
@@ -1863,6 +1869,34 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} - {fmt % args}", file=sys.stderr, flush=True)
+
+    def log_request(self, code='-', size='-'):
+        """One line per FAILED request (>= 400) and one per-hour count line; every request only with
+        SAMPLER_VERBOSE. The routine polling (jamfan26 asks all seven directories every few seconds)
+        was 60% of the journal."""
+        try:
+            c = int(code)
+        except (TypeError, ValueError):
+            c = 0
+        _http_tally(c)
+        if VERBOSE or c >= 400:
+            super().log_request(code, size)
+
+_http_counts = collections.Counter()
+_http_hour = None
+_http_lock = threading.Lock()
+
+def _http_tally(code: int) -> None:
+    """Count requests by status class; print the previous hour's counts when the UTC hour turns."""
+    global _http_hour
+    hour = time.strftime('%Y-%m-%dT%H', time.gmtime())
+    with _http_lock:
+        if _http_hour is not None and hour != _http_hour and _http_counts:
+            parts = ' '.join(f'{k}={v}' for k, v in sorted(_http_counts.items()))
+            print(f'[http] {_http_hour}Z requests {sum(_http_counts.values())}: {parts}', file=sys.stderr, flush=True)
+            _http_counts.clear()
+        _http_hour = hour
+        _http_counts[f'{code // 100}xx' if code else 'other'] += 1
 
 def _midnight_rollover_loop():
     """At each UTC midnight, roll _today_peak into _yesterday_peak and reset."""

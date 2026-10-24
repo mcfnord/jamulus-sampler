@@ -51,7 +51,9 @@ answers from that memory. The HTTP surface is a drop-in for softins' `servers.ph
 
 `SAMPLER_HTTP_PORT` (5001), `SAMPLER_UDP_BASE` (22134: the sweep socket; pool and on-demand ports
 follow), `SAMPLER_ADMIN_IPS` (comma list allowed to read `/stats`, `/debug/stuck` and POST
-`/ping-density`; `127.0.0.1` always). Two instances on one host need different bases.
+`/ping-density`; `127.0.0.1` always). Two instances on one host need different bases. `SAMPLER_VERBOSE=1` turns on the per-server
+`[sweep]` lines and one line per HTTP request; by default only failed requests (>= 400) are logged, plus one
+`[http] <hour>Z requests N: 2xx=… 4xx=…` count line per UTC hour.
 
 ## How to work on it
 
@@ -60,8 +62,10 @@ follow), `SAMPLER_ADMIN_IPS` (comma list allowed to read `/stats`, `/debug/stuck
   (~3 minutes).
 - Read the production vantage, not just a developer box: NAT servers, the pool at 15/15 and the
   hole-punch only show up on the host that the directories know.
-- Log lines are counts and addresses, never player names. Do not add a per-packet log line: the
-  sweep answers tens of thousands of hellos an hour.
+- Log lines are counts and addresses, never player names. Do not add a per-packet or per-server log
+  line outside `VERBOSE`: the sweep answers tens of thousands of hellos an hour, and on 2026-10-24 the
+  per-server sweep lines plus one line per routine HTTP request were ~95% of a journal that then held
+  less than a day.
 - State is in memory only; a restart forgets every server, so every client gets a fresh
   `first_seen` at restart time.
 
