@@ -42,6 +42,9 @@ RAW_TTL           = 86400.0  # s — re-ask a server whether it supports raw aud
 RAW_RETRY         = 1800.0   # s — a raw-audio ask that opened no channel is retried after this
 RAW_PER_SWEEP     = int(os.environ.get('SAMPLER_RAW_PER_SWEEP', '4'))  # raw-audio asks per scheduled sweep (0 = off)
 RAW_WAIT          = 1.5      # s — how long one sweep's raw-audio asks wait for CLIENT_ID / RAWAUDIO_SUPPORTED
+PUNCH_STREAK      = 3        # consecutive failed pool probes, with a recent sweep answer, that mark a server punch-only
+PUNCH_WAIT        = 1.0      # s — how long a punched ?query= waits for the server's hello after the list request
+PUNCH_COOLDOWN    = 5.0      # s — at most one punch list request per directory in this window (else the query goes cold)
 ONDEMAND_PORTS    = 4      # UDP ports above the probe pool, reserved for ?server= / ?query=
 
 # ── Protocol constants ────────────────────────────────────────────────────────
@@ -679,6 +682,21 @@ def sweep_directory(host: str, port: int, ip: str = None, probe_raw: bool = Fals
         return server_list, probe_results, None
 
 
+def _needs_punch(ss: dict, now: float) -> bool:
+    """A server our pool ports cannot reach but the sweep can: its last PUNCH_STREAK pool probes
+    failed while a directory sweep heard from it recently. Measured 2026-10-24: 112 of the 277
+    servers the sampler reached answered no cold ping from an unpunched socket. Live, not a list:
+    one pool success clears it, and a server the sweep stops hearing from drops out. (caller holds lock)"""
+    return (ss.get('_pool_fail_streak', 0) >= PUNCH_STREAK
+            and now - ss.get('_last_sweep_success', 0.0) < DIRECTORY_SWEEP * 2)
+
+
+def _data_refreshed_at(ss: dict) -> float:
+    """When this server's served client data was last refreshed by an answer: a successful pool
+    probe or a sweep reply, whichever is newer. (caller holds lock)"""
+    return max(ss.get('_pool_ok_at', 0.0), ss.get('_last_sweep_success', 0.0))
+
+
 def _raw_due(key: str, now: float) -> bool:
     """A server is due a raw-audio ask when it never answered one, its answer is older than
     RAW_TTL, or its version string changed since (a new binary may add or drop --noraw)."""
@@ -870,6 +888,11 @@ _watchdog_last   = 0.0  # last [watchdog] warn (see WATCHDOG_WARN_EVERY)
 _reaped_total    = 0   # servers retired by the membership reaper (see REAP_AFTER)
 _probes_t0       = time.time()   # set at startup
 _tasks_submitted = 0   # total srv tasks dispatched to executor (including early-exit ones)
+_pool_port_s_ok         = 0.0   # pool-port seconds held by probes that got an answer
+_pool_port_s_fail       = 0.0   # ... by probes that got none
+_pool_port_s_fail_punch = 0.0   # ... of which on servers already judged punch-only (_needs_punch)
+_punch_last: dict = {}          # directory "host:port" → time of its last punch list request (PUNCH_COOLDOWN)
+_punch_lock = threading.Lock()
 
 # Ping-density signal pushed from gather-server-data.py every ~60s
 _active_pool:    int   = 0    # unique ALLOWED client IPs seen in last 180s
@@ -1167,8 +1190,19 @@ def _do_srv_task(srv_key: str):
         state['_min_probe'] = 0.0
         state['_last_probe_start'] = probe_start
         state['_probe_attempts'] += 1
+        global _pool_port_s_ok, _pool_port_s_fail, _pool_port_s_fail_punch
+        held = now - probe_start
         if result['ping'] >= 0:
             state['_probe_successes'] += 1
+            state['_pool_ok_at'] = now
+            state['_pool_fail_streak'] = 0
+            _pool_port_s_ok += held
+        else:
+            punch_only = _needs_punch(state, now)    # judged before this failure is counted
+            state['_pool_fail_streak'] = state.get('_pool_fail_streak', 0) + 1
+            _pool_port_s_fail += held
+            if punch_only:
+                _pool_port_s_fail_punch += held
 
         sweep_age = now - state.get('_last_sweep_success', 0)
         sweep_fresh = sweep_age < DIRECTORY_SWEEP * 2
@@ -1446,17 +1480,61 @@ def _single_server_rows(host: str, port: int, name: str):
     return [_server_row(tmp, 0, single=True)]
 
 
+def _punch_directory_for(ip: str, port: int):
+    """(directory ip, port, "host:port") to punch through before a ?query= of this server, or None.
+    Only for a server _needs_punch() flags, only via a directory that lists it, and at most one
+    punch per directory per PUNCH_COOLDOWN, so ?query= cannot be used to hammer a directory."""
+    key, now = f"{ip}:{port}", time.time()
+    with _STATE_LOCK:
+        ss = SERVER_STATE.get(key)
+        if ss is None or not _needs_punch(ss, now):
+            return None
+        hp = next((h for h, ds in DIRECTORY_STATE.items() if key in ds['servers']), None)
+        if hp is None:
+            return None
+        dhost, dport = DIRECTORY_STATE[hp]['host'], DIRECTORY_STATE[hp]['port']
+    with _punch_lock:
+        if now - _punch_last.get(hp, 0.0) < PUNCH_COOLDOWN:
+            return None
+        _punch_last[hp] = now
+    dip = resolve_ipv4(dhost)
+    return (dip, dport, hp) if dip else None
+
+
 def _query_welcome(ip: str, port: int) -> dict:
     """?query= : servers.php's short audio connection. Send one pseudo audio frame, acknowledge
     every connected-mode message, collect CLIENT_ID / RAWAUDIO_SUPPORTED / CHAT_TEXT (the welcome
-    text), then disconnect twice. Returns only what the server sent."""
+    text), then disconnect twice. Returns only what the server sent.
+    Better than servers.php for a punch-only server (_needs_punch): first ask a directory that lists
+    it for its list FROM THIS SOCKET, so the directory has the server say hello to this port, and
+    connect to the address the hello came from. servers.php connects cold and gets nothing from such
+    a server (measured 2026-10-24: 0 of 6 cold, 6 of 6 after a list request on the same socket)."""
     out = {}
+    punch = _punch_directory_for(ip, port)
     lport = ONDEMAND_POOL.acquire()         # never waits on the probe pool
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(TIMEOUT_SEC)
     try:
         sock.bind(('0.0.0.0', lport))
-        sock.sendto(AUDIO_PROBE, (ip, port))
+        target = (ip, port)
+        if punch:
+            dip, dport, hp = punch
+            sock.sendto(REQ_SERVER_LIST_PKT, (dip, dport))
+            hello, end = None, time.time() + PUNCH_WAIT
+            while time.time() < end and hello is None:
+                try:
+                    data, (fip, fport) = sock.recvfrom(32767)
+                except socket.timeout:
+                    continue
+                parsed = parse_header(data) if fip == ip else None
+                if parsed and parsed[0] == CLM_EMPTY_MESSAGE:
+                    hello = (fip, fport)
+            if hello:
+                target = hello
+            print(f'[query] {ip}:{port} punch via {hp}: hello '
+                  f'{"from " + str(hello[1]) if hello else "none"} (local port {lport or "ephemeral"})',
+                  file=sys.stderr, flush=True)
+        sock.sendto(AUDIO_PROBE, target)
         attempts, got_any = 1, False
         deadline = time.time() + TIMEOUT_SEC * MAX_ATTEMPTS * 2
         while time.time() < deadline:
@@ -1466,13 +1544,13 @@ def _query_welcome(ip: str, port: int) -> dict:
                 if got_any or attempts >= MAX_ATTEMPTS:
                     break
                 attempts += 1
-                sock.sendto(AUDIO_PROBE, (ip, port))
+                sock.sendto(AUDIO_PROBE, target)
                 continue
             if fip != ip:
                 continue
             parsed = parse_header(data)
-            if not parsed:
-                continue                  # audio frames back from the server, or garbage
+            if not parsed or parsed[0] == CLM_EMPTY_MESSAGE:
+                continue                  # audio frames back from the server, garbage, or a late hello
             got_any = True
             mid, cnt, payload = parsed
             if ACKN < mid < CLM_START:
@@ -1485,7 +1563,10 @@ def _query_welcome(ip: str, port: int) -> dict:
                 out['welcome'] = parse_u16_string(payload)
                 break
         for _ in range(2):
-            sock.sendto(DISCONNECTION_PKT, (ip, port))
+            sock.sendto(DISCONNECTION_PKT, target)
+        if punch:
+            print(f'[query] {ip}:{port} punched result: client_id {"yes" if "client_id" in out else "no"}, '
+                  f'rawaudio {"yes" if out.get("rawaudio") else "no"}', file=sys.stderr, flush=True)
         return out
     finally:
         sock.close()
@@ -1569,6 +1650,20 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     for hp, ds in DIRECTORY_STATE.items()
                 ]
+                # Staleness: how old the client data we serve for an OCCUPIED room is — seconds since
+                # a pool probe or a sweep last refreshed it — split by whether the room is punch-only.
+                def _age_summary(ages):
+                    if not ages:
+                        return {'n': 0}
+                    a = sorted(ages)
+                    pick = lambda q: round(a[min(len(a) - 1, int(q * (len(a) - 1) + 0.5))], 1)
+                    return {'n': len(a), 'p50': pick(0.5), 'p90': pick(0.9), 'max': round(a[-1], 1)}
+                occ = [(ip_port, s) for ip_port, s in SERVER_STATE.items() if s['ping'] >= 0 and s['nclients'] > 0]
+                ages_direct = [now_s - _data_refreshed_at(s) for _, s in occ if not _needs_punch(s, now_s)]
+                ages_punch  = [now_s - _data_refreshed_at(s) for _, s in occ if _needs_punch(s, now_s)]
+                oldest = sorted(((now_s - _data_refreshed_at(s), ip_port, s['name'], _needs_punch(s, now_s))
+                                 for ip_port, s in occ), reverse=True)[:8]
+                n_punch = sum(1 for s in SERVER_STATE.values() if _needs_punch(s, now_s))
                 unreachable_servers = [
                     {
                         'ip_port':         ip_port,
@@ -1614,6 +1709,20 @@ class Handler(BaseHTTPRequestHandler):
                     'per_minute': round(_probes_total / elapsed * 60, 1) if elapsed > 0 else 0,
                 },
                 'directories':          dirs_info,
+                'punch_only':           n_punch,
+                'occupied_data_age_s': {
+                    'direct':     _age_summary(ages_direct),
+                    'punch_only': _age_summary(ages_punch),
+                    'oldest':     [{'ip_port': k, 'name': n, 'age_s': round(a, 1), 'punch_only': po}
+                                   for a, k, n, po in oldest],
+                },
+                'pool_port_seconds': {
+                    'ok':              round(_pool_port_s_ok, 1),
+                    'failed':          round(_pool_port_s_fail, 1),
+                    'failed_on_punch_only': round(_pool_port_s_fail_punch, 1),
+                    'ports_busy_failing_avg': round(_pool_port_s_fail / elapsed, 2) if elapsed > 0 else 0,
+                    'ports_busy_failing_punch_only_avg': round(_pool_port_s_fail_punch / elapsed, 2) if elapsed > 0 else 0,
+                },
                 'unreachable_servers':  unreachable_servers,
                 'activity': {
                     t: sum(
