@@ -47,6 +47,10 @@ RAW_WAIT          = 1.5      # s — how long one sweep's raw-audio asks wait fo
 PUNCH_STREAK      = 3        # consecutive failed pool probes, with a recent sweep answer, that mark a server punch-only
 PUNCH_WAIT        = 1.0      # s — how long a punched ?query= waits for the server's hello after the list request
 PUNCH_COOLDOWN    = 5.0      # s — at most one punch list request per directory in this window (else the query goes cold)
+PUNCH_PROBE_INTERVAL = float(os.environ.get('SAMPLER_PUNCH_PROBE_S', '600'))  # s — pool-probe a punch-only server this rarely
+# A punch-only server's pool probes fail by definition and refresh nothing it serves: its data comes
+# from the directory sweep (~100 s). Measured 2026-10-24 21:48-22:42Z: those probes held 7.58 of the
+# 15 pool ports on average. One every PUNCH_PROBE_INTERVAL is enough to notice it turning reachable.
 ONDEMAND_PORTS    = 4      # UDP ports above the probe pool, reserved for ?server= / ?query=
 
 # ── Protocol constants ────────────────────────────────────────────────────────
@@ -1257,6 +1261,8 @@ def _do_srv_task(srv_key: str):
                 state['last_absent'][fkey] = prev_probe_time
 
         state['clients']    = new_clients
+        if not probe_ok and _needs_punch(state, now):
+            interval = max(interval, PUNCH_PROBE_INTERVAL)   # only the sweep refreshes it (see PUNCH_PROBE_INTERVAL)
         state['_min_probe'] = now + interval * 0.8
 
         state['_probe_inflight'] = False
@@ -1812,6 +1818,7 @@ class Handler(BaseHTTPRequestHandler):
                     and SERVER_STATE[ip_port]['nclients'] == 0
                     and now_req - SERVER_STATE[ip_port]['_last_probe_start'] > _idle_cap
                     and SERVER_STATE[ip_port]['_min_probe'] <= now_req
+                    and not _needs_punch(SERVER_STATE[ip_port], now_req)   # a poke cannot reach it either
                 ]
         if ds is None:
             ip = resolve_ipv4(host)
